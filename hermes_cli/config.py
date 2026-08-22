@@ -976,7 +976,17 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
-    "fallback_providers": [],
+    # A fresh install must never be a dead end: if the primary provider loses
+    # auth or runs out of credit, the chain walks to zero-cost OpenRouter slugs
+    # before it ever reaches a billable one. LuminaVault provisions one Hermes
+    # per tenant from a fresh PVC, so this default is what a new tenant inherits.
+    # Slugs verified against the OpenRouter models API on 2026-08-21.
+    # Requires OPENROUTER_API_KEY; without it the chain simply fails through.
+    "fallback_providers": [
+        {"provider": "openrouter", "model": "z-ai/glm-5.2:free"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
+    ],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
