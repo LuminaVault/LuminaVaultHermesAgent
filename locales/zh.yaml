@@ -393,6 +393,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ 无法转写 — 你今天的语音消息额度已用完，明天重置。"
     unavailable_rate_limit: "⚠️ 无法转写 — 当前语音消息过多，请一分钟后再试。"
     unavailable_auth:      "⚠️ 无法转写 — 此账号的语音功能配置不正确。"
+    unavailable_reply_quota: "⚠️ 我将以文字回复 — 语音服务额度已用尽。"
+    unavailable_reply_rate_limit: "⚠️ 我将以文字回复 — 当前语音回复过多。"
+    unavailable_reply_auth: "⚠️ 我将以文字回复 — 此账号的语音回复配置不正确。"
     status_stt_ok:         "转写：可用"
     status_stt_off:        "转写：已关闭（stt.enabled 为 false）"
 

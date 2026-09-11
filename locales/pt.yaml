@@ -393,6 +393,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ Não consegui transcrever: usaste as tuas mensagens de voz de hoje. É reposto amanhã."
     unavailable_rate_limit: "⚠️ Não consegui transcrever: demasiadas mensagens de voz agora. Tenta de novo daqui a um minuto."
     unavailable_auth:      "⚠️ Não consegui transcrever: a voz não está configurada corretamente para esta conta."
+    unavailable_reply_quota: "⚠️ Vou responder em texto — o serviço de voz ficou sem crédito."
+    unavailable_reply_rate_limit: "⚠️ Vou responder em texto — demasiadas respostas de voz agora."
+    unavailable_reply_auth: "⚠️ Vou responder em texto — as respostas faladas não estão bem configuradas para esta conta."
     status_stt_ok:         "Transcrição: disponível"
     status_stt_off:        "Transcrição: desligada (stt.enabled é false)"
 

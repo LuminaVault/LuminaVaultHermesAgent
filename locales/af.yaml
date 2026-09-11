@@ -393,6 +393,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ Ek kon dit nie transkribeer nie — jy het vandag se stemboodskappe opgebruik. Dit stel môre terug."
     unavailable_rate_limit: "⚠️ Ek kon dit nie transkribeer nie — te veel stemboodskappe so pas. Probeer oor 'n minuut weer."
     unavailable_auth:      "⚠️ Ek kon dit nie transkribeer nie — stem is nie korrek vir hierdie rekening opgestel nie."
+    unavailable_reply_quota: "⚠️ Ek antwoord in teks — die stemdiens het nie meer krediet nie."
+    unavailable_reply_rate_limit: "⚠️ Ek antwoord in teks — te veel stemantwoorde so pas."
+    unavailable_reply_auth: "⚠️ Ek antwoord in teks — gesproke antwoorde is nie korrek opgestel nie."
     status_stt_ok:         "Transkripsie: beskikbaar"
     status_stt_off:        "Transkripsie: af (stt.enabled is vals)"
 

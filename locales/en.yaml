@@ -405,6 +405,9 @@ gateway:
     unavailable_quota:     "⚠️ I couldn't transcribe that — you've used your voice messages for today. It resets tomorrow."
     unavailable_rate_limit: "⚠️ I couldn't transcribe that — too many voice messages just now. Try again in a minute."
     unavailable_auth:      "⚠️ I couldn't transcribe that — voice isn't set up correctly for this account."
+    unavailable_reply_quota: "⚠️ I'll reply in text — the voice service is out of credit for now."
+    unavailable_reply_rate_limit: "⚠️ I'll reply in text — too many voice replies just now."
+    unavailable_reply_auth: "⚠️ I'll reply in text — spoken replies aren't set up correctly for this account."
     status_stt_ok:         "Transcription: available"
     status_stt_off:        "Transcription: off (stt.enabled is false)"
 

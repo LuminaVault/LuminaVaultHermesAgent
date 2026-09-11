@@ -393,6 +393,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ Je n'ai pas pu transcrire ce message : vous avez utilisé vos messages vocaux du jour. Le quota est réinitialisé demain."
     unavailable_rate_limit: "⚠️ Je n'ai pas pu transcrire ce message : trop de messages vocaux à la fois. Réessayez dans une minute."
     unavailable_auth:      "⚠️ Je n'ai pas pu transcrire ce message : la voix n'est pas correctement configurée pour ce compte."
+    unavailable_reply_quota: "⚠️ Je réponds en texte : le service vocal n'a plus de crédit."
+    unavailable_reply_rate_limit: "⚠️ Je réponds en texte : trop de réponses vocales à la fois."
+    unavailable_reply_auth: "⚠️ Je réponds en texte : les réponses vocales ne sont pas correctement configurées pour ce compte."
     status_stt_ok:         "Transcription : disponible"
     status_stt_off:        "Transcription : désactivée (stt.enabled est false)"
 

@@ -41,6 +41,12 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
+    AUDIO_ERROR_KIND_AUTH,
+    AUDIO_ERROR_KIND_QUOTA,
+    AUDIO_ERROR_KIND_RATE_LIMIT,
+    AUDIO_ERROR_KIND_UPSTREAM,
+    AUDIO_USER_FACING_ERROR_KINDS,
+    classify_audio_status,
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
     resolve_openai_audio_api_key,
@@ -1331,28 +1337,22 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 # A transient upstream blip should stay silent; being out of quota should not,
 # because the user can act on it and will otherwise just see their voice notes
 # quietly stop working.
-STT_ERROR_KIND_QUOTA = "quota"
-STT_ERROR_KIND_RATE_LIMIT = "rate_limit"
-STT_ERROR_KIND_AUTH = "auth"
-STT_ERROR_KIND_UPSTREAM = "upstream"
+# Aliases onto the shared taxonomy in ``tools.tool_backend_helpers``. TTS
+# classifies failures the same way, and the gateway decides whether to surface
+# one using a single set — two copies of this would drift the first time a
+# provider started returning a status the other side did not know about.
+STT_ERROR_KIND_QUOTA = AUDIO_ERROR_KIND_QUOTA
+STT_ERROR_KIND_RATE_LIMIT = AUDIO_ERROR_KIND_RATE_LIMIT
+STT_ERROR_KIND_AUTH = AUDIO_ERROR_KIND_AUTH
+STT_ERROR_KIND_UPSTREAM = AUDIO_ERROR_KIND_UPSTREAM
 
 #: Error kinds the gateway surfaces to the user rather than only logging.
-STT_USER_FACING_ERROR_KINDS = frozenset({
-    STT_ERROR_KIND_QUOTA,
-    STT_ERROR_KIND_RATE_LIMIT,
-    STT_ERROR_KIND_AUTH,
-})
+STT_USER_FACING_ERROR_KINDS = AUDIO_USER_FACING_ERROR_KINDS
 
 
 def classify_stt_status(status_code: Optional[int]) -> str:
     """Map an HTTP status from an OpenAI-shaped STT endpoint to an error kind."""
-    if status_code == 402:
-        return STT_ERROR_KIND_QUOTA
-    if status_code == 429:
-        return STT_ERROR_KIND_RATE_LIMIT
-    if status_code in (401, 403):
-        return STT_ERROR_KIND_AUTH
-    return STT_ERROR_KIND_UPSTREAM
+    return classify_audio_status(status_code)
 
 
 def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:

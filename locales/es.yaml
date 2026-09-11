@@ -390,6 +390,9 @@ gateway:
     unavailable_quota:     "⚠️ No pude transcribir eso: has usado tus mensajes de voz de hoy. Se restablece mañana."
     unavailable_rate_limit: "⚠️ No pude transcribir eso: demasiados mensajes de voz ahora mismo. Inténtalo de nuevo en un minuto."
     unavailable_auth:      "⚠️ No pude transcribir eso: la voz no está configurada correctamente para esta cuenta."
+    unavailable_reply_quota: "⚠️ Responderé en texto: el servicio de voz se ha quedado sin crédito."
+    unavailable_reply_rate_limit: "⚠️ Responderé en texto: demasiadas respuestas de voz ahora mismo."
+    unavailable_reply_auth: "⚠️ Responderé en texto: las respuestas habladas no están bien configuradas para esta cuenta."
     status_stt_ok:         "Transcripción: disponible"
     status_stt_off:        "Transcripción: desactivada (stt.enabled es false)"
 

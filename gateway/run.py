@@ -2913,11 +2913,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
-        # Per-chat cooldown for the "voice unavailable" notice, keyed
-        # ``platform:chat_id``. Values are ``time.monotonic()`` stamps. Shared
-        # across sessions is fine and intended — the cooldown is per chat, and
-        # the only thing at stake is how often one chat is told the same thing.
-        self._stt_notice_sent_at: Dict[str, float] = {}
+        # Per-chat cooldown for the "voice unavailable" notices, keyed
+        # ``<direction>:platform:chat_id``. Values are ``time.monotonic()``
+        # stamps. Shared across sessions is fine and intended — the cooldown is
+        # per chat, and the only thing at stake is how often one chat is told
+        # the same thing. Inbound (transcription) and outbound (spoken replies)
+        # are tracked separately: they fail for different reasons and a user
+        # silenced on one should still hear about the other.
+        self._voice_notice_sent_at: Dict[str, float] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._active_session_leases: Dict[str, Any] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
@@ -10474,7 +10477,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # This fires only for actionable causes, is debounced per chat,
                 # and is localized — a transient upstream blip still degrades
                 # quietly to the marker alone.
-                await self._notify_stt_unavailable(event, source, _stt_error_kinds)
+                await self._notify_voice_unavailable(event, source, _stt_error_kinds)
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
@@ -13156,11 +13159,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     #: How long to stay quiet after warning a chat that voice is unavailable.
     #: A user out of quota often sends several voice notes before reading the
     #: reply; one warning is information, five is noise.
-    _STT_NOTICE_COOLDOWN_SECONDS = 600
+    _VOICE_NOTICE_COOLDOWN_SECONDS = 600
 
-    async def _notify_stt_unavailable(self, event, source, error_kinds) -> None:
-        """Send one localized notice when transcription failed for an
-        actionable reason.
+    async def _notify_voice_unavailable(
+        self, event, source, error_kinds, direction: str = "stt",
+    ) -> None:
+        """Send one localized notice when voice failed for an actionable reason.
+
+        ``direction`` is ``"stt"`` for inbound transcription or ``"tts"`` for
+        spoken replies; it selects the message and scopes the cooldown.
 
         No-op when every failure was transient, when the chat was warned
         recently, or when the platform adapter is unavailable. Never raises —
@@ -13169,11 +13176,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not error_kinds:
             return
         try:
-            from tools.transcription_tools import (
-                STT_ERROR_KIND_AUTH,
-                STT_ERROR_KIND_QUOTA,
-                STT_ERROR_KIND_RATE_LIMIT,
-                STT_USER_FACING_ERROR_KINDS,
+            from tools.tool_backend_helpers import (
+                AUDIO_ERROR_KIND_AUTH as STT_ERROR_KIND_AUTH,
+                AUDIO_ERROR_KIND_QUOTA as STT_ERROR_KIND_QUOTA,
+                AUDIO_ERROR_KIND_RATE_LIMIT as STT_ERROR_KIND_RATE_LIMIT,
+                AUDIO_USER_FACING_ERROR_KINDS as STT_USER_FACING_ERROR_KINDS,
             )
         except ImportError:
             return
@@ -13190,13 +13197,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if kind is None or kind not in STT_USER_FACING_ERROR_KINDS:
             return
 
-        chat_key = f"{getattr(source, 'platform', None)}:{getattr(source, 'chat_id', None)}"
+        chat_key = (
+            f"{direction}:{getattr(source, 'platform', None)}"
+            f":{getattr(source, 'chat_id', None)}"
+        )
         now = time.monotonic()
-        last = self._stt_notice_sent_at.get(chat_key)
-        if last is not None and (now - last) < self._STT_NOTICE_COOLDOWN_SECONDS:
+        last = self._voice_notice_sent_at.get(chat_key)
+        if last is not None and (now - last) < self._VOICE_NOTICE_COOLDOWN_SECONDS:
             return
 
-        message = t(f"gateway.voice.unavailable_{kind}")
+        suffix = "" if direction == "stt" else "_reply"
+        message = t(f"gateway.voice.unavailable{suffix}_{kind}")
         try:
             adapter = self._adapter_for_source(source)
             if adapter is None:
@@ -13205,9 +13216,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source, self._reply_anchor_for_event(event)
             )
             await adapter.send(source.chat_id, message, metadata=metadata)
-            self._stt_notice_sent_at[chat_key] = now
+            self._voice_notice_sent_at[chat_key] = now
         except Exception as exc:
-            logger.debug("STT unavailable notice failed (non-fatal): %s", exc)
+            logger.debug("Voice unavailable notice failed (non-fatal): %s", exc)
 
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
@@ -13247,6 +13258,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             actual_path = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual_path):
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+                # The text reply is unaffected — this runs before it — so a
+                # failure here costs the audio and nothing else. Say why when
+                # the cause is actionable (out of credits, rate limited,
+                # misconfigured), because otherwise voice replies just stop
+                # happening and the user has no way to find out. Transient
+                # blips stay quiet.
+                _kind = result.get("error_kind")
+                if _kind:
+                    await self._notify_voice_unavailable(
+                        event, event.source, [_kind], direction="tts",
+                    )
                 return
 
             adapter = self._adapter_for_source(event.source)

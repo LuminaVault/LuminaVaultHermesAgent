@@ -397,6 +397,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ Níorbh fhéidir liom é sin a thraslitriú — tá teachtaireachtaí gutha an lae inniu úsáidte agat. Athshocrófar amárach é."
     unavailable_rate_limit: "⚠️ Níorbh fhéidir liom é sin a thraslitriú — an iomarca teachtaireachtaí gutha faoi láthair. Bain triail eile as i gceann nóiméid."
     unavailable_auth:      "⚠️ Níorbh fhéidir liom é sin a thraslitriú — níl an guth socraithe i gceart don chuntas seo."
+    unavailable_reply_quota: "⚠️ Freagróidh mé i dtéacs — tá an tseirbhís gutha as creidmheas."
+    unavailable_reply_rate_limit: "⚠️ Freagróidh mé i dtéacs — an iomarca freagraí gutha faoi láthair."
+    unavailable_reply_auth: "⚠️ Freagróidh mé i dtéacs — níl freagraí labhartha socraithe i gceart don chuntas seo."
     status_stt_ok:         "Traslitriú: ar fáil"
     status_stt_off:        "Traslitriú: múchta (tá stt.enabled bréagach)"
 

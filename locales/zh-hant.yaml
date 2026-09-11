@@ -393,6 +393,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ 無法轉寫 — 你今天的語音訊息額度已用完，明天重設。"
     unavailable_rate_limit: "⚠️ 無法轉寫 — 目前語音訊息過多，請一分鐘後再試。"
     unavailable_auth:      "⚠️ 無法轉寫 — 此帳號的語音功能設定不正確。"
+    unavailable_reply_quota: "⚠️ 我會以文字回覆 — 語音服務額度已用盡。"
+    unavailable_reply_rate_limit: "⚠️ 我會以文字回覆 — 目前語音回覆過多。"
+    unavailable_reply_auth: "⚠️ 我會以文字回覆 — 此帳號的語音回覆設定不正確。"
     status_stt_ok:         "轉寫：可用"
     status_stt_off:        "轉寫：已關閉（stt.enabled 為 false）"
 

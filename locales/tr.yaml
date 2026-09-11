@@ -393,6 +393,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     unavailable_quota:     "⚠️ Bunu yazıya dökemedim — bugünkü sesli mesaj hakkını kullandın. Yarın sıfırlanıyor."
     unavailable_rate_limit: "⚠️ Bunu yazıya dökemedim — şu anda çok fazla sesli mesaj var. Bir dakika sonra tekrar dene."
     unavailable_auth:      "⚠️ Bunu yazıya dökemedim — bu hesap için ses doğru yapılandırılmamış."
+    unavailable_reply_quota: "⚠️ Metinle yanıtlayacağım — ses servisinin kredisi bitti."
+    unavailable_reply_rate_limit: "⚠️ Metinle yanıtlayacağım — şu anda çok fazla sesli yanıt var."
+    unavailable_reply_auth: "⚠️ Metinle yanıtlayacağım — bu hesap için sesli yanıtlar doğru yapılandırılmamış."
     status_stt_ok:         "Yazıya dökme: kullanılabilir"
     status_stt_off:        "Yazıya dökme: kapalı (stt.enabled false)"
 
