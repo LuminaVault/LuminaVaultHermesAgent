@@ -1327,6 +1327,34 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# Failure classes worth telling the user about, as opposed to logging.
+# A transient upstream blip should stay silent; being out of quota should not,
+# because the user can act on it and will otherwise just see their voice notes
+# quietly stop working.
+STT_ERROR_KIND_QUOTA = "quota"
+STT_ERROR_KIND_RATE_LIMIT = "rate_limit"
+STT_ERROR_KIND_AUTH = "auth"
+STT_ERROR_KIND_UPSTREAM = "upstream"
+
+#: Error kinds the gateway surfaces to the user rather than only logging.
+STT_USER_FACING_ERROR_KINDS = frozenset({
+    STT_ERROR_KIND_QUOTA,
+    STT_ERROR_KIND_RATE_LIMIT,
+    STT_ERROR_KIND_AUTH,
+})
+
+
+def classify_stt_status(status_code: Optional[int]) -> str:
+    """Map an HTTP status from an OpenAI-shaped STT endpoint to an error kind."""
+    if status_code == 402:
+        return STT_ERROR_KIND_QUOTA
+    if status_code == 429:
+        return STT_ERROR_KIND_RATE_LIMIT
+    if status_code in (401, 403):
+        return STT_ERROR_KIND_AUTH
+    return STT_ERROR_KIND_UPSTREAM
+
+
 def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using OpenAI Whisper API (paid)."""
     try:
@@ -1347,7 +1375,7 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         model_name = DEFAULT_STT_MODEL
 
     try:
-        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, APIStatusError
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
@@ -1373,6 +1401,22 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": f"Connection error: {e}"}
     except APITimeoutError as e:
         return {"success": False, "transcript": "", "error": f"Request timeout: {e}"}
+    except APIStatusError as e:
+        # Must precede APIError, which is its parent. The SDK builds
+        # ``e.message`` from the response body's ``error.message``, so when
+        # the endpoint is the LuminaVault audio proxy this is already the
+        # sentence written for the user — pass it through rather than
+        # wrapping it in our own phrasing.
+        kind = classify_stt_status(getattr(e, "status_code", None))
+        message = getattr(e, "message", None) or str(e)
+        if kind != STT_ERROR_KIND_UPSTREAM:
+            logger.warning("OpenAI transcription refused (%s): %s", kind, message)
+        return {
+            "success": False,
+            "transcript": "",
+            "error": message,
+            "error_kind": kind,
+        }
     except APIError as e:
         return {"success": False, "transcript": "", "error": f"API error: {e}"}
     except Exception as e:

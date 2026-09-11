@@ -2913,6 +2913,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
+        # Per-chat cooldown for the "voice unavailable" notice, keyed
+        # ``platform:chat_id``. Values are ``time.monotonic()`` stamps. Shared
+        # across sessions is fine and intended — the cooldown is per chat, and
+        # the only thing at stake is how often one chat is told the same thing.
+        self._stt_notice_sent_at: Dict[str, float] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._active_session_leases: Dict[str, Any] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
@@ -10452,10 +10457,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             if audio_paths:
+                _stt_error_kinds: List[str] = []
                 message_text, _successful_transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    error_sink=_stt_error_kinds,
                 )
+                # Tell the user when transcription failed for a reason they can
+                # act on — out of quota, rate limited, misconfigured. The LLM
+                # cannot say this: all it receives is a neutral marker, and it
+                # has no idea why.
+                #
+                # Deliberately narrow. An earlier version of this call site sent
+                # a hardcoded notice on *every* failure, which produced a second
+                # pre-canned reply alongside the model's own and was removed.
+                # This fires only for actionable causes, is debounced per chat,
+                # and is localized — a transient upstream blip still degrades
+                # quietly to the marker alone.
+                await self._notify_stt_unavailable(event, source, _stt_error_kinds)
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
@@ -13134,6 +13153,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
+    #: How long to stay quiet after warning a chat that voice is unavailable.
+    #: A user out of quota often sends several voice notes before reading the
+    #: reply; one warning is information, five is noise.
+    _STT_NOTICE_COOLDOWN_SECONDS = 600
+
+    async def _notify_stt_unavailable(self, event, source, error_kinds) -> None:
+        """Send one localized notice when transcription failed for an
+        actionable reason.
+
+        No-op when every failure was transient, when the chat was warned
+        recently, or when the platform adapter is unavailable. Never raises —
+        a failed notice must not take down the message that triggered it.
+        """
+        if not error_kinds:
+            return
+        try:
+            from tools.transcription_tools import (
+                STT_ERROR_KIND_AUTH,
+                STT_ERROR_KIND_QUOTA,
+                STT_ERROR_KIND_RATE_LIMIT,
+                STT_USER_FACING_ERROR_KINDS,
+            )
+        except ImportError:
+            return
+
+        # Quota outranks rate-limit outranks auth: report the most actionable.
+        kind = next(
+            (
+                k
+                for k in (STT_ERROR_KIND_QUOTA, STT_ERROR_KIND_RATE_LIMIT, STT_ERROR_KIND_AUTH)
+                if k in error_kinds
+            ),
+            None,
+        )
+        if kind is None or kind not in STT_USER_FACING_ERROR_KINDS:
+            return
+
+        chat_key = f"{getattr(source, 'platform', None)}:{getattr(source, 'chat_id', None)}"
+        now = time.monotonic()
+        last = self._stt_notice_sent_at.get(chat_key)
+        if last is not None and (now - last) < self._STT_NOTICE_COOLDOWN_SECONDS:
+            return
+
+        message = t(f"gateway.voice.unavailable_{kind}")
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                return
+            metadata = self._thread_metadata_for_source(
+                source, self._reply_anchor_for_event(event)
+            )
+            await adapter.send(source.chat_id, message, metadata=metadata)
+            self._stt_notice_sent_at[chat_key] = now
+        except Exception as exc:
+            logger.debug("STT unavailable notice failed (non-fatal): %s", exc)
+
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
@@ -15197,6 +15272,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         audio_paths: List[str],
+        error_sink: Optional[List[str]] = None,
     ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -15214,6 +15290,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 clips that were successfully transcribed, in input order. Empty
                 list if every clip failed or STT is disabled. Callers can use
                 this to echo transcripts back to the user before the agent loop.
+
+        ``error_sink``, when provided, collects the ``error_kind`` of each
+        failed clip (see ``tools.transcription_tools.classify_stt_status``).
+        It is opt-in via a mutable argument rather than a third return value so
+        existing callers keep working unchanged, and per-call rather than
+        instance state because sessions transcribe concurrently.
         """
         if not getattr(self.config, "stt_enabled", True):
             notes = []
@@ -15265,6 +15347,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # logged for operator diagnosis but kept out of the
                     # LLM-visible prompt.
                     logger.info("Voice transcription failed for %s: %s", path, error)
+                    # The marker above is all the LLM sees. The *reason* goes
+                    # to the caller instead, which can tell the user something
+                    # actionable out of band without putting quota mechanics
+                    # into the conversation history.
+                    if error_sink is not None:
+                        kind = result.get("error_kind")
+                        if kind:
+                            error_sink.append(kind)
                     enriched_parts.append("[voice message could not be transcribed]")
             except Exception as e:
                 logger.error("Transcription error: %s", e)

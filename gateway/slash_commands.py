@@ -2510,7 +2510,15 @@ class GatewaySlashCommandsMixin:
                         status = t("gateway.voice.speaking") if m.get("is_speaking") else ""
                         lines.append(t("gateway.voice.status_member", name=m['display_name'], status=status))
                     return "\n".join(lines)
-            return t("gateway.voice.status_mode", label=labels.get(mode, mode))
+            # Voice mode is only half the story: if inbound transcription is
+            # disabled the user can have `/voice on` set and still see nothing
+            # happen when they speak. Say so here rather than making them
+            # discover it by trying.
+            _stt_on = bool(getattr(getattr(self, "config", None), "stt_enabled", True))
+            return "\n".join([
+                t("gateway.voice.status_mode", label=labels.get(mode, mode)),
+                t("gateway.voice.status_stt_ok" if _stt_on else "gateway.voice.status_stt_off"),
+            ])
         else:
             # Toggle: off → on, on/all → off
             current = self._voice_mode.get(voice_key, "off")
