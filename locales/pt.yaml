@@ -390,6 +390,11 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (resposta de voz a todas as mensagens)"
     help:                  "{toggle}\n\n**Como funciona o /voice**\n• `/voice on` — resposta por voz quando envias uma mensagem de voz\n• `/voice tts` — resposta por voz a *todas* as mensagens\n• `/voice off` — voltar às respostas apenas em texto\n• `/voice status` — mostrar o modo atual\n• `/voice` (sem argumento) — alternar rapidamente entre ligado e desligado{channels}"
     help_channels:         "\n\n**Canais de voz ao vivo (Discord)**\n• Entra primeiro num canal de voz, depois `/voice channel` — eu entro, ouço e falo as minhas respostas\n• `/voice leave` — desligar do canal de voz"
+    unavailable_quota:     "⚠️ Não consegui transcrever: usaste as tuas mensagens de voz de hoje. É reposto amanhã."
+    unavailable_rate_limit: "⚠️ Não consegui transcrever: demasiadas mensagens de voz agora. Tenta de novo daqui a um minuto."
+    unavailable_auth:      "⚠️ Não consegui transcrever: a voz não está configurada corretamente para esta conta."
+    status_stt_ok:         "Transcrição: disponível"
+    status_stt_off:        "Transcrição: desligada (stt.enabled é false)"
 
   yolo:
     disabled:                   "⚠️ Modo YOLO **DESATIVADO** nesta sessão — comandos perigosos exigirão aprovação."

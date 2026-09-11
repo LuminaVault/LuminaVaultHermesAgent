@@ -390,6 +390,11 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (tüm mesajlara sesli yanıt)"
     help:                  "{toggle}\n\n**/voice nasıl çalışır**\n• `/voice on` — sesli mesaj gönderdiğinde sesli yanıt\n• `/voice tts` — *her* mesaja sesli yanıt\n• `/voice off` — yalnızca metin yanıtlarına dön\n• `/voice status` — geçerli modu göster\n• `/voice` (argümansız) — açık ve kapalı arasında hızlı geçiş{channels}"
     help_channels:         "\n\n**Canlı ses kanalları (Discord)**\n• Önce bir ses kanalına katıl, sonra `/voice channel` — katılırım, dinlerim ve yanıtlarımı sesli söylerim\n• `/voice leave` — ses kanalından ayrıl"
+    unavailable_quota:     "⚠️ Bunu yazıya dökemedim — bugünkü sesli mesaj hakkını kullandın. Yarın sıfırlanıyor."
+    unavailable_rate_limit: "⚠️ Bunu yazıya dökemedim — şu anda çok fazla sesli mesaj var. Bir dakika sonra tekrar dene."
+    unavailable_auth:      "⚠️ Bunu yazıya dökemedim — bu hesap için ses doğru yapılandırılmamış."
+    status_stt_ok:         "Yazıya dökme: kullanılabilir"
+    status_stt_off:        "Yazıya dökme: kapalı (stt.enabled false)"
 
   yolo:
     disabled:                   "⚠️ Bu oturumda YOLO modu **KAPALI** — tehlikeli komutlar onay gerektirecek."
