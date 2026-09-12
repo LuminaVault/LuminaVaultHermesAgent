@@ -10465,6 +10465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     audio_paths,
                     error_sink=_stt_error_kinds,
+                    channel=self._stt_channel(source),
                 )
                 # Tell the user when transcription failed for a reason they can
                 # act on — out of quota, rate limited, misconfigured. The LLM
@@ -13224,6 +13225,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+    @staticmethod
+    def _stt_channel(source: Any) -> Optional[str]:
+        """Name the platform a clip arrived on, for STT metering attribution.
+
+        Accepts anything carrying ``.platform`` — a ``SessionSource`` or a
+        ``MessageEvent`` — because the four transcription call sites have one
+        or the other in scope. Returns None rather than raising when neither
+        is available: attribution is advisory, and a voice note must still be
+        transcribed when we cannot name where it came from.
+        """
+        platform = getattr(source, "platform", None)
+        if platform is None:
+            return None
+        value = getattr(platform, "value", platform)
+        return str(value) or None
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
@@ -15295,6 +15312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_text: str,
         audio_paths: List[str],
         error_sink: Optional[List[str]] = None,
+        channel: Optional[str] = None,
     ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -15303,6 +15321,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Args:
             user_text:   The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
+            channel:     The platform these clips arrived on, forwarded to the
+                         STT provider for metering attribution. Optional, and
+                         purely advisory — see
+                         ``tools.transcription_tools._audio_attribution_headers``.
 
         Returns:
             A tuple of ``(enriched_text, successful_transcripts)``:
@@ -15347,7 +15369,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result = await asyncio.to_thread(transcribe_audio, path, channel=channel)
                 if result["success"]:
                     transcript = result["transcript"]
                     successful_transcripts.append(transcript)
@@ -15434,7 +15456,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if audio_paths:
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
-                text, audio_paths,
+                text, audio_paths, channel=self._stt_channel(source),
             )
             # Echo raw transcripts back to the user when configured so voice
             # interrupts feel identical to fresh voice messages.
@@ -19412,6 +19434,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     try:
                                         _enriched, _transcripts = await self._enrich_message_with_transcription(
                                             pending_text, _audio_paths,
+                                            channel=self._stt_channel(source),
                                         )
                                         pending_text = _enriched
                                         if _transcripts and self._should_echo_stt_transcripts():
@@ -19834,6 +19857,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         try:
                             _enriched, _transcripts = await self._enrich_message_with_transcription(
                                 _pending_text, _audio_paths,
+                                channel=self._stt_channel(source),
                             )
                             pending = _enriched or None
                             if _transcripts and self._should_echo_stt_transcripts():
