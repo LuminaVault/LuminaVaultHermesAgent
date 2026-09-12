@@ -1021,11 +1021,27 @@ class TestAuxiliaryClientProviderPriority:
     """Verify auxiliary client resolution doesn't break for any provider."""
 
     def test_openrouter_always_wins(self, monkeypatch):
+        """OpenRouter wins when its key is present.
+
+        The model is whatever the shipped fallback chain names first, not the
+        hardcoded ``_OPENROUTER_MODEL``. ``get_text_auxiliary_client`` resolves
+        the user-configured ``fallback_providers`` chain (step 2) before the
+        hardcoded provider discovery chain (step 3) — see the comment at
+        ``agent/auxiliary_client.py``: "the hardcoded provider discovery chain
+        below is only the convenience default for users who have not declared a
+        fallback policy". Since `feat(config): ship a default fallback provider
+        chain` (2026-08-22), DEFAULT_CONFIG always declares one, so step 3 is
+        unreachable here. Asserting the constant pinned this test to a branch
+        the default config no longer takes.
+        """
+        from hermes_cli.config import DEFAULT_CONFIG
+        expected_model = DEFAULT_CONFIG["fallback_providers"][0]["model"]
+
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         from agent.auxiliary_client import get_text_auxiliary_client
         with patch("agent.auxiliary_client.OpenAI") as mock:
             client, model = get_text_auxiliary_client()
-        assert model == "google/gemini-3-flash-preview"
+        assert model == expected_model
         assert "openrouter" in str(mock.call_args.kwargs["base_url"]).lower()
 
     def test_nous_when_no_openrouter(self, monkeypatch):
