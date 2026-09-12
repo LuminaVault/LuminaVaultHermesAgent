@@ -74,7 +74,9 @@ async def test_voice_message_still_transcribed():
             history=[],
         )
 
-    mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
+    # The platform rides along so the audio proxy can meter Telegram voice
+    # separately from every other source that shares the OpenAI wire shape.
+    mock_transcribe.assert_called_once_with("/tmp/voice.ogg", channel="telegram")
     # The transcript passes through as a plain quoted line — no "voice message"
     # meta-commentary in the LLM-visible prompt.
     assert "hello world" in result
