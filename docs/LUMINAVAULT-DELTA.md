@@ -53,6 +53,36 @@ subsystem wired to it — `ingestion.publicBaseUrl`, `ingestionCapabilitiesServi
 and a "Durable multimodal ingestion" path in `Sources/App/App+build.swift`.
 Losing it breaks that feature.
 
+## Terminal output on `/v1/runs` — added 2026-09-22
+
+Upstream streams an agent's terminal only over the `tui_gateway` WebSocket,
+which the cluster deployment does not run (it runs `hermes gateway run`
+alone), and `/v1/runs` drops the terminal tool's command and result. So no
+LuminaVault client could see what the agent ran. This adds it to the run
+stream, additively:
+
+| File | Change |
+|---|---|
+| `gateway/platforms/api_run_terminal.py` | **new** — field builders and `RunTerminalRouter` |
+| `gateway/platforms/api_server.py` | ~25 lines: import, router install in `__init__`, extra fields in `_make_run_event_callback`, register/unregister around `run_conversation` |
+| `tests/gateway/test_api_run_terminal.py` | **new** — 18 cases, one end to end through `/v1/runs` |
+
+Wire additions, all optional fields or a new event name:
+
+- `tool.started` for `terminal`: `command`, `background`
+- `tool.completed` for `terminal`: `output` (tail, 16k chars), `exit_code`,
+  `output_truncated`
+- new `terminal.output`: `{process_id, chunk}` or `{process_id, chunk: "", truncated: true}`
+
+Background output is routed by the process's `session_key`, which `/v1/runs`
+binds to the `run_id`; `task_id` is useless for this because the terminal tool
+collapses it to the shared container key. Output is coalesced (250 ms / 4k
+chars) and capped at 256k chars per run because consumers persist every event,
+and everything is passed through `redact_sensitive_text(force=True)`.
+
+The diff is saved as [`luminavault-delta-run-terminal.patch`](./luminavault-delta-run-terminal.patch).
+A re-import must re-apply it alongside `luminavault-delta.patch`.
+
 ## Upstream content the import dropped — 6 paths
 
 All six were lost to `.gitignore` rules inherited from upstream, because the
