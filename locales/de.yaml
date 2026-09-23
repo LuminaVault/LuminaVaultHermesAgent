@@ -390,6 +390,14 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (Sprachantwort auf alle Nachrichten)"
     help:                  "{toggle}\n\n**So funktioniert /voice**\n• `/voice on` — Sprachantwort, wenn du eine Sprachnachricht sendest\n• `/voice tts` — Sprachantwort auf *jede* Nachricht\n• `/voice off` — zurück zu reinen Textantworten\n• `/voice status` — aktuellen Modus anzeigen\n• `/voice` (ohne Argument) — schnelles Umschalten zwischen an und aus{channels}"
     help_channels:         "\n\n**Live-Sprachkanäle (Discord)**\n• Tritt zuerst einem Sprachkanal bei, dann `/voice channel` — ich trete bei, höre zu und spreche meine Antworten\n• `/voice leave` — vom Sprachkanal trennen"
+    unavailable_quota:     "⚠️ Ich konnte das nicht transkribieren — du hast deine Sprachnachrichten für heute aufgebraucht. Morgen gibt es wieder neue."
+    unavailable_rate_limit: "⚠️ Ich konnte das nicht transkribieren — gerade zu viele Sprachnachrichten. Versuch es in einer Minute noch einmal."
+    unavailable_auth:      "⚠️ Ich konnte das nicht transkribieren — Sprache ist für dieses Konto nicht richtig eingerichtet."
+    unavailable_reply_quota: "⚠️ Ich antworte als Text — der Sprachdienst hat kein Guthaben mehr."
+    unavailable_reply_rate_limit: "⚠️ Ich antworte als Text — gerade zu viele Sprachantworten."
+    unavailable_reply_auth: "⚠️ Ich antworte als Text — gesprochene Antworten sind für dieses Konto nicht richtig eingerichtet."
+    status_stt_ok:         "Transkription: verfügbar"
+    status_stt_off:        "Transkription: aus (stt.enabled ist false)"
 
   yolo:
     disabled:                   "⚠️ YOLO-Modus für diese Sitzung **AUS** — gefährliche Befehle benötigen eine Genehmigung."

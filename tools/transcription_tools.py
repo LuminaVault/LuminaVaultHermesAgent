@@ -41,6 +41,12 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
+    AUDIO_ERROR_KIND_AUTH,
+    AUDIO_ERROR_KIND_QUOTA,
+    AUDIO_ERROR_KIND_RATE_LIMIT,
+    AUDIO_ERROR_KIND_UPSTREAM,
+    AUDIO_USER_FACING_ERROR_KINDS,
+    classify_audio_status,
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
     resolve_openai_audio_api_key,
@@ -1327,7 +1333,82 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
+# Failure classes worth telling the user about, as opposed to logging.
+# A transient upstream blip should stay silent; being out of quota should not,
+# because the user can act on it and will otherwise just see their voice notes
+# quietly stop working.
+# Aliases onto the shared taxonomy in ``tools.tool_backend_helpers``. TTS
+# classifies failures the same way, and the gateway decides whether to surface
+# one using a single set — two copies of this would drift the first time a
+# provider started returning a status the other side did not know about.
+STT_ERROR_KIND_QUOTA = AUDIO_ERROR_KIND_QUOTA
+STT_ERROR_KIND_RATE_LIMIT = AUDIO_ERROR_KIND_RATE_LIMIT
+STT_ERROR_KIND_AUTH = AUDIO_ERROR_KIND_AUTH
+STT_ERROR_KIND_UPSTREAM = AUDIO_ERROR_KIND_UPSTREAM
+
+#: Error kinds the gateway surfaces to the user rather than only logging.
+STT_USER_FACING_ERROR_KINDS = AUDIO_USER_FACING_ERROR_KINDS
+
+
+def classify_stt_status(status_code: Optional[int]) -> str:
+    """Map an HTTP status from an OpenAI-shaped STT endpoint to an error kind."""
+    return classify_audio_status(status_code)
+
+
+#: Header carrying the messaging platform a voice note arrived on, and the
+#: surface within it. The LuminaVault audio proxy meters every transcription,
+#: but over the OpenAI wire shape it can only see the tenant — a Telegram
+#: voice note and an iOS mic recording look identical. These let the usage
+#: rows answer "what does Telegram voice cost us".
+#:
+#: Advisory only: an unknown or missing channel is recorded as ``unknown``
+#: server-side. Transcription must never fail because attribution failed,
+#: which is also why the value is scrubbed rather than passed through — a
+#: plugin platform names itself, and an httpx client raises on a header value
+#: containing a newline.
+STT_CHANNEL_HEADER = "X-Lumina-Channel"
+STT_SURFACE_HEADER = "X-Lumina-Surface"
+STT_SURFACE_VOICE_NOTE = "voice_note"
+
+_CHANNEL_HEADER_MAX_LEN = 32
+
+
+def _normalize_channel(channel: Optional[str]) -> Optional[str]:
+    """Reduce a platform name to a bare lowercase token, or None.
+
+    Truncates at the first character outside ``[a-z0-9_-]`` rather than
+    filtering those characters out. ``"telegram\\nX-Evil: 1"`` must become
+    ``"telegram"``, not ``"telegramx-evil1"`` — a filter would splice
+    injected text onto a legitimate name and produce a plausible-looking
+    channel that no platform actually is.
+    """
+    if not channel:
+        return None
+    token = []
+    for ch in str(channel).strip().lower():
+        if ch.isascii() and (ch.isalnum() or ch in "_-"):
+            token.append(ch)
+            continue
+        break
+    return "".join(token[:_CHANNEL_HEADER_MAX_LEN]) or None
+
+
+def _audio_attribution_headers(channel: Optional[str]) -> Dict[str, str]:
+    """Request headers attributing a transcription to its origin channel."""
+    token = _normalize_channel(channel)
+    if token is None:
+        return {}
+    return {
+        STT_CHANNEL_HEADER: token,
+        STT_SURFACE_HEADER: STT_SURFACE_VOICE_NOTE,
+    }
+
+
+def _transcribe_openai(
+    file_path: str,
+    model_name: str,
+    channel: Optional[str] = None,
+) -> Dict[str, Any]:
     """Transcribe using OpenAI Whisper API (paid)."""
     try:
         api_key, base_url = _resolve_openai_audio_client_config()
@@ -1347,8 +1428,14 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         model_name = DEFAULT_STT_MODEL
 
     try:
-        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, APIStatusError
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=30,
+            max_retries=0,
+            default_headers=_audio_attribution_headers(channel),
+        )
         try:
             with open(file_path, "rb") as audio_file:
                 transcription = client.audio.transcriptions.create(
@@ -1373,6 +1460,22 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": f"Connection error: {e}"}
     except APITimeoutError as e:
         return {"success": False, "transcript": "", "error": f"Request timeout: {e}"}
+    except APIStatusError as e:
+        # Must precede APIError, which is its parent. The SDK builds
+        # ``e.message`` from the response body's ``error.message``, so when
+        # the endpoint is the LuminaVault audio proxy this is already the
+        # sentence written for the user — pass it through rather than
+        # wrapping it in our own phrasing.
+        kind = classify_stt_status(getattr(e, "status_code", None))
+        message = getattr(e, "message", None) or str(e)
+        if kind != STT_ERROR_KIND_UPSTREAM:
+            logger.warning("OpenAI transcription refused (%s): %s", kind, message)
+        return {
+            "success": False,
+            "transcript": "",
+            "error": message,
+            "error_kind": kind,
+        }
     except APIError as e:
         return {"success": False, "transcript": "", "error": f"API error: {e}"}
     except Exception as e:
@@ -1621,7 +1724,11 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    channel: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
 
@@ -1632,6 +1739,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     Args:
         file_path: Absolute path to the audio file to transcribe.
         model:     Override the model. If None, uses config or provider default.
+        channel:   The messaging platform this audio arrived on ("telegram",
+                   "discord", …), for metering attribution. Only the
+                   OpenAI-shaped path carries it, since that is the one that
+                   may point at the LuminaVault audio proxy. Optional — a
+                   caller with no platform context omits it.
 
     Returns:
         dict with keys:
@@ -1677,7 +1789,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     if provider == "openai":
         openai_cfg = stt_config.get("openai") or {}
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(file_path, model_name)
+        return _transcribe_openai(file_path, model_name, channel=channel)
 
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral") or {}
@@ -1762,7 +1874,11 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
 
     direct_api_key = resolve_openai_audio_api_key()
     if direct_api_key:
-        return direct_api_key, OPENAI_BASE_URL
+        # Honour a configured ``stt.openai.base_url`` on the env-key path too.
+        # Without this, a deployment that puts the key in the environment and
+        # the endpoint in config.yaml silently sends that key to api.openai.com.
+        # Mirrors ``tts_tool._generate_openai_tts``, which already does this.
+        return direct_api_key, (cfg_base_url or OPENAI_BASE_URL)
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:

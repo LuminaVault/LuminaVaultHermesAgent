@@ -390,6 +390,14 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (모든 메시지에 음성으로 응답)"
     help:                  "{toggle}\n\n**/voice 사용법**\n• `/voice on` — 음성 메시지를 보내면 음성으로 답변\n• `/voice tts` — *모든* 메시지에 음성으로 답변\n• `/voice off` — 텍스트 전용 답변으로 복귀\n• `/voice status` — 현재 모드 표시\n• `/voice` (인자 없음) — 켜기와 끄기를 빠르게 전환{channels}"
     help_channels:         "\n\n**라이브 음성 채널 (Discord)**\n• 먼저 음성 채널에 들어간 다음 `/voice channel` — 제가 참여해 듣고 음성으로 답변합니다\n• `/voice leave` — 음성 채널에서 연결 해제"
+    unavailable_quota:     "⚠️ 받아쓰기를 할 수 없습니다. 오늘의 음성 메시지를 모두 사용했습니다. 내일 초기화됩니다."
+    unavailable_rate_limit: "⚠️ 받아쓰기를 할 수 없습니다. 지금 음성 메시지가 너무 많습니다. 1분 후에 다시 시도하세요."
+    unavailable_auth:      "⚠️ 받아쓰기를 할 수 없습니다. 이 계정에 음성이 올바르게 설정되어 있지 않습니다."
+    unavailable_reply_quota: "⚠️ 텍스트로 답변합니다. 음성 서비스 크레딧이 소진되었습니다."
+    unavailable_reply_rate_limit: "⚠️ 텍스트로 답변합니다. 지금 음성 답변이 너무 많습니다."
+    unavailable_reply_auth: "⚠️ 텍스트로 답변합니다. 이 계정에 음성 답변이 올바르게 설정되어 있지 않습니다."
+    status_stt_ok:         "받아쓰기: 사용 가능"
+    status_stt_off:        "받아쓰기: 꺼짐 (stt.enabled가 false)"
 
   yolo:
     disabled:                   "⚠️ 이 세션에서 YOLO 모드 **꺼짐** — 위험한 명령은 승인이 필요합니다."

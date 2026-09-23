@@ -390,6 +390,14 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (risposta vocale a tutti i messaggi)"
     help:                  "{toggle}\n\n**Come funziona /voice**\n• `/voice on` — risposta vocale quando invii un messaggio vocale\n• `/voice tts` — risposta vocale a *ogni* messaggio\n• `/voice off` — torna alle risposte solo testo\n• `/voice status` — mostra la modalità attuale\n• `/voice` (senza argomento) — alterna rapidamente tra attivo e disattivo{channels}"
     help_channels:         "\n\n**Canali vocali dal vivo (Discord)**\n• Entra prima in un canale vocale, poi `/voice channel` — mi unisco, ascolto e parlo le mie risposte\n• `/voice leave` — disconnetti dal canale vocale"
+    unavailable_quota:     "⚠️ Non sono riuscito a trascriverlo: hai esaurito i messaggi vocali di oggi. Si azzera domani."
+    unavailable_rate_limit: "⚠️ Non sono riuscito a trascriverlo: troppi messaggi vocali in questo momento. Riprova tra un minuto."
+    unavailable_auth:      "⚠️ Non sono riuscito a trascriverlo: la voce non è configurata correttamente per questo account."
+    unavailable_reply_quota: "⚠️ Rispondo in testo: il servizio vocale ha esaurito il credito."
+    unavailable_reply_rate_limit: "⚠️ Rispondo in testo: troppe risposte vocali in questo momento."
+    unavailable_reply_auth: "⚠️ Rispondo in testo: le risposte vocali non sono configurate correttamente per questo account."
+    status_stt_ok:         "Trascrizione: disponibile"
+    status_stt_off:        "Trascrizione: disattivata (stt.enabled è false)"
 
   yolo:
     disabled:                   "⚠️ Modalità YOLO **OFF** per questa sessione — i comandi pericolosi richiederanno approvazione."
