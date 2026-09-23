@@ -21,6 +21,27 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
 
+# The agent runs on a worker thread and the approval prompt lands via a notify
+# callback, so every E2E case below has to wait for that hand-off. The waits
+# used to be `for _ in range(50): time.sleep(0.05)` — a 2.5s budget that a
+# loaded CI runner overruns, which surfaced as "approval prompt did not route
+# to session A" and, one assert later, `'NoneType' object is not subscriptable`
+# when the worker had not produced a result yet. The prompt arrives in
+# milliseconds when the machine is idle, so a longer ceiling costs nothing
+# locally and stops the flake in CI.
+_NOTIFY_WAIT_SECONDS = 15.0
+
+
+def _wait_until(predicate, timeout: float = _NOTIFY_WAIT_SECONDS) -> bool:
+    """Poll ``predicate`` until it is truthy or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
@@ -456,10 +477,7 @@ class TestBlockingApprovalE2E:
         t = threading.Thread(target=agent_thread)
         t.start()
 
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
+        _wait_until(lambda: notified)
 
         assert len(notified) == 1
         assert "rm -rf /important" in notified[0]["command"]
@@ -503,10 +521,7 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
+        _wait_until(lambda: notified)
 
         resolve_gateway_approval(session_key, "deny")
         t.join(timeout=5)
@@ -847,10 +862,7 @@ class TestCrossSessionApprovalIsolation:
         t = threading.Thread(target=worker_a)
         t.start()
         try:
-            for _ in range(50):
-                if notified_a or notified_b:
-                    break
-                time.sleep(0.05)
+            _wait_until(lambda: notified_a or notified_b)
 
             # The prompt must land in session A (the originator), never B.
             assert len(notified_a) == 1, "approval prompt did not route to session A"

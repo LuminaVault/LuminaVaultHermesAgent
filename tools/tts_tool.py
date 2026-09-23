@@ -71,6 +71,7 @@ def get_env_value(name, default=None):
     return default if value is None else value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
+    classify_audio_exception,
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
@@ -2456,10 +2457,14 @@ def text_to_speech_tool(
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     except Exception as e:
-        # Unexpected errors
+        # Unexpected errors. Classify first: running out of credits and being
+        # rate limited are things the user can act on, and the gateway decides
+        # whether to say so out of band. Everything unrecognised stays
+        # `upstream`, which is treated as a transient blip and kept quiet.
+        error_kind = classify_audio_exception(e)
         error_msg = f"TTS generation failed ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
-        return tool_error(error_msg, success=False)
+        return tool_error(error_msg, success=False, error_kind=error_kind)
 
 
 # ===========================================================================

@@ -61,6 +61,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from gateway.platforms import api_run_terminal as _run_terminal
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
@@ -880,6 +881,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # LuminaVault: routes process_registry output onto the run stream.
+        self._run_terminal_router = _run_terminal.RunTerminalRouter()
+        try:
+            from tools.process_registry import process_registry as _process_registry
+            self._run_terminal_router.install(_process_registry)
+        except Exception:
+            logger.debug("run terminal router not installed", exc_info=True)
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -1821,6 +1829,92 @@ class APIServerAdapter(BasePlatformAdapter):
             "limit": limit,
             "offset": offset,
             "has_more": len(sessions) == limit,
+        })
+
+    async def _handle_instance(self, request: "web.Request") -> "web.Response":
+        """GET /api/instance — who this Hermes is: host, profiles, version.
+
+        Connected platforms and readiness live in ``/health/detailed``; this
+        adds what a multi-instance dashboard needs to label and group rows.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        import socket
+
+        from hermes_cli import __version__
+        from hermes_cli import profile_sessions
+        from hermes_cli.profiles import get_active_profile_name
+
+        try:
+            active = get_active_profile_name()
+        except Exception:
+            active = "default"
+        return web.json_response({
+            "object": "hermes.instance",
+            "hostname": socket.gethostname(),
+            "version": __version__,
+            "profile": active,
+            "profiles": profile_sessions.profile_names(),
+        })
+
+    async def _handle_profiles_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/profiles/sessions — sessions from every profile, newest first.
+
+        Read-only. ``profile`` narrows to one profile; ``source`` to one
+        platform (telegram, discord, api_server, cron, …). Rows carry
+        ``profile`` and ``is_active``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from hermes_cli import profile_sessions
+
+        limit = self._parse_nonnegative_int(request.query.get("limit"), default=50, maximum=200)
+        offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=100_000)
+        try:
+            result = await asyncio.to_thread(
+                profile_sessions.list_sessions,
+                limit=limit,
+                offset=offset,
+                source=request.query.get("source") or None,
+                profile=request.query.get("profile") or None,
+                project=self._session_response,
+            )
+        except profile_sessions.UnknownProfileError as exc:
+            return web.json_response(_openai_error(str(exc), code="profile_not_found"), status=404)
+        return web.json_response({
+            "object": "list",
+            "data": result["data"],
+            "limit": limit,
+            "offset": offset,
+            "has_more": result["has_more"],
+            "errors": result["errors"],
+        })
+
+    async def _handle_profile_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /api/profiles/{profile}/sessions/{session_id}/messages — the log."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from hermes_cli import profile_sessions
+
+        profile = request.match_info["profile"]
+        session_id = request.match_info["session_id"]
+        try:
+            found = await asyncio.to_thread(profile_sessions.session_messages, profile, session_id)
+        except profile_sessions.UnknownProfileError as exc:
+            return web.json_response(_openai_error(str(exc), code="profile_not_found"), status=404)
+        if found is None:
+            return web.json_response(
+                _openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404
+            )
+        resolved_id, messages = found
+        return web.json_response({
+            "object": "list",
+            "profile": profile,
+            "session_id": resolved_id,
+            "data": [self._message_response(m) for m in messages],
         })
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
@@ -4252,6 +4346,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    # LuminaVault: the terminal command (api_run_terminal).
+                    **_run_terminal.started_fields(tool_name, args),
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -4261,7 +4357,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    # LuminaVault: the terminal output tail (api_run_terminal).
+                    **_run_terminal.completed_fields(tool_name, kwargs.get("result")),
                 })
+            elif event_type == "terminal.output":
+                # LuminaVault: coalesced background-process output, pushed by
+                # RunTerminalRouter from process reader threads.
+                _push({"run_id": run_id, **kwargs.get("event", {})})
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
@@ -4463,6 +4565,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    # LuminaVault: stream background processes this run spawns.
+                    self._run_terminal_router.register(
+                        approval_session_key,
+                        lambda event: event_cb("terminal.output", event=event),
+                    )
                     try:
                         # Bind approval/session identity for this API run via
                         # contextvars so concurrent runs do not share process
@@ -4478,6 +4585,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             task_id=effective_task_id,
                         )
                     finally:
+                        self._run_terminal_router.unregister(approval_session_key)
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:
@@ -4922,6 +5030,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+            # Cross-profile, read-only views for remote dashboards (LuminaVault
+            # Agents page): one API key reports every profile on this machine.
+            self._app.router.add_get("/api/instance", self._handle_instance)
+            self._app.router.add_get("/api/profiles/sessions", self._handle_profiles_sessions)
+            self._app.router.add_get(
+                "/api/profiles/{profile}/sessions/{session_id}/messages",
+                self._handle_profile_session_messages,
+            )
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
