@@ -390,6 +390,14 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (すべてのメッセージに音声で返信)"
     help:                  "{toggle}\n\n**/voice の使い方**\n• `/voice on` — 音声メッセージを送ると音声で返信\n• `/voice tts` — *すべての*メッセージに音声で返信\n• `/voice off` — テキストのみの返信に戻す\n• `/voice status` — 現在のモードを表示\n• `/voice`（引数なし）— オンとオフをすばやく切り替え{channels}"
     help_channels:         "\n\n**ライブ音声チャンネル (Discord)**\n• 先に音声チャンネルに参加してから `/voice channel` — 参加して聞き取り、音声で返信します\n• `/voice leave` — 音声チャンネルから切断"
+    unavailable_quota:     "⚠️ 文字起こしできませんでした。本日分の音声メッセージを使い切りました。明日リセットされます。"
+    unavailable_rate_limit: "⚠️ 文字起こしできませんでした。音声メッセージが多すぎます。1分ほど待ってからお試しください。"
+    unavailable_auth:      "⚠️ 文字起こしできませんでした。このアカウントでは音声が正しく設定されていません。"
+    unavailable_reply_quota: "⚠️ テキストで返信します。音声サービスのクレジットが不足しています。"
+    unavailable_reply_rate_limit: "⚠️ テキストで返信します。音声返信が多すぎます。"
+    unavailable_reply_auth: "⚠️ テキストで返信します。このアカウントでは音声返信が正しく設定されていません。"
+    status_stt_ok:         "文字起こし: 利用可能"
+    status_stt_off:        "文字起こし: オフ (stt.enabled が false)"
 
   yolo:
     disabled:                   "⚠️ このセッションの YOLO モードは **OFF** — 危険なコマンドには承認が必要です。"

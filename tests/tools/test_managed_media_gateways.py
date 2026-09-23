@@ -132,6 +132,15 @@ def _install_fake_fal_client(captured):
     return fal_client_module
 
 
+class _FakeAPIStatusError(Exception):
+    """Stand-in for ``openai.APIStatusError`` (an HTTP failure with a status)."""
+
+    def __init__(self, message="", status_code=None):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
 def _install_fake_openai_module(captured, transcription_response=None):
     class FakeSpeechResponse:
         def stream_to_file(self, output_path):
@@ -169,6 +178,11 @@ def _install_fake_openai_module(captured, transcription_response=None):
         APIError=Exception,
         APIConnectionError=Exception,
         APITimeoutError=Exception,
+        # Distinct subclass, not a bare Exception: `transcription_tools`
+        # catches APIStatusError ahead of APIError to classify HTTP status
+        # codes, and aliasing the two would make that handler swallow
+        # connection and timeout failures too.
+        APIStatusError=_FakeAPIStatusError,
     )
     sys.modules["openai"] = fake_module
 
