@@ -152,7 +152,7 @@ class TestExtractFallback:
 
 class TestListCommand:
     def test_list_empty(self, isolated_home, capsys):
-        _write_config(isolated_home, {})
+        _write_config(isolated_home, {"fallback_providers": []})
         from hermes_cli.fallback_cmd import cmd_fallback_list
         cmd_fallback_list(types.SimpleNamespace())
         out = capsys.readouterr().out
@@ -179,6 +179,7 @@ class TestListCommand:
     def test_list_migrates_legacy_for_display(self, isolated_home, capsys):
         _write_config(isolated_home, {
             "fallback_model": {"provider": "openrouter", "model": "gpt-5.4"},
+            "fallback_providers": [],
         })
         from hermes_cli.fallback_cmd import cmd_fallback_list
         cmd_fallback_list(types.SimpleNamespace())
@@ -195,6 +196,7 @@ class TestAddCommand:
     def test_add_appends_new_entry(self, isolated_home, capsys):
         _write_config(isolated_home, {
             "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
+            "fallback_providers": [],
         })
 
         def fake_picker(args=None):
@@ -286,6 +288,7 @@ class TestAddCommand:
                 "base_url": "https://api.anthropic.com",
                 "api_mode": "anthropic_messages",
             },
+            "fallback_providers": [],
         })
 
         def fake_picker(args=None):
@@ -362,7 +365,7 @@ class TestAddCommand:
 
 class TestRemoveCommand:
     def test_remove_empty_chain(self, isolated_home, capsys):
-        _write_config(isolated_home, {})
+        _write_config(isolated_home, {"fallback_providers": []})
         from hermes_cli.fallback_cmd import cmd_fallback_remove
         cmd_fallback_remove(types.SimpleNamespace())
         out = capsys.readouterr().out
@@ -413,7 +416,7 @@ class TestRemoveCommand:
 
 class TestClearCommand:
     def test_clear_empty_chain(self, isolated_home, capsys):
-        _write_config(isolated_home, {})
+        _write_config(isolated_home, {"fallback_providers": []})
         from hermes_cli.fallback_cmd import cmd_fallback_clear
         cmd_fallback_clear(types.SimpleNamespace())
         out = capsys.readouterr().out
@@ -453,21 +456,21 @@ class TestClearCommand:
 
 class TestDispatcher:
     def test_no_subcommand_lists(self, isolated_home, capsys):
-        _write_config(isolated_home, {})
+        _write_config(isolated_home, {"fallback_providers": []})
         from hermes_cli.fallback_cmd import cmd_fallback
         cmd_fallback(types.SimpleNamespace(fallback_command=None))
         out = capsys.readouterr().out
         assert "No fallback providers configured" in out
 
     def test_list_alias(self, isolated_home, capsys):
-        _write_config(isolated_home, {})
+        _write_config(isolated_home, {"fallback_providers": []})
         from hermes_cli.fallback_cmd import cmd_fallback
         cmd_fallback(types.SimpleNamespace(fallback_command="ls"))
         out = capsys.readouterr().out
         assert "No fallback providers configured" in out
 
     def test_remove_alias(self, isolated_home, capsys):
-        _write_config(isolated_home, {})
+        _write_config(isolated_home, {"fallback_providers": []})
         from hermes_cli.fallback_cmd import cmd_fallback
         cmd_fallback(types.SimpleNamespace(fallback_command="rm"))
         out = capsys.readouterr().out

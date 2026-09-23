@@ -390,6 +390,14 @@ Future messages in this room will use that transcript until `/reset` or another 
     label_all:             "TTS (hangválasz minden üzenetre)"
     help:                  "{toggle}\n\n**Hogyan működik a /voice**\n• `/voice on` — hangválasz, amikor hangüzenetet küldesz\n• `/voice tts` — hangválasz *minden* üzenetre\n• `/voice off` — vissza a csak szöveges válaszokhoz\n• `/voice status` — az aktuális mód megjelenítése\n• `/voice` (argumentum nélkül) — gyors váltás be és ki között{channels}"
     help_channels:         "\n\n**Élő hangcsatornák (Discord)**\n• Először lépj be egy hangcsatornába, majd `/voice channel` — csatlakozom, hallgatok és hangosan válaszolok\n• `/voice leave` — lecsatlakozás a hangcsatornáról"
+    unavailable_quota:     "⚠️ Nem tudtam átírni — elhasználtad a mai hangüzeneteidet. Holnap alaphelyzetbe áll."
+    unavailable_rate_limit: "⚠️ Nem tudtam átírni — túl sok hangüzenet érkezett egyszerre. Próbáld újra egy perc múlva."
+    unavailable_auth:      "⚠️ Nem tudtam átírni — a hang nincs helyesen beállítva ehhez a fiókhoz."
+    unavailable_reply_quota: "⚠️ Szövegben válaszolok — a hangszolgáltatásnak elfogyott a kerete."
+    unavailable_reply_rate_limit: "⚠️ Szövegben válaszolok — túl sok hangválasz érkezett egyszerre."
+    unavailable_reply_auth: "⚠️ Szövegben válaszolok — a hangos válaszok nincsenek helyesen beállítva ehhez a fiókhoz."
+    status_stt_ok:         "Átírás: elérhető"
+    status_stt_off:        "Átírás: kikapcsolva (az stt.enabled hamis)"
 
   yolo:
     disabled:                   "⚠️ YOLO mód **KI** ebben a munkamenetben — a veszélyes parancsok jóváhagyást igényelnek."

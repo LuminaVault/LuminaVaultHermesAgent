@@ -1,5 +1,6 @@
 """Tests for the hermes_cli models module."""
 
+import pytest
 from unittest.mock import patch, MagicMock
 
 from hermes_cli.nous_account import NousPortalAccountInfo
@@ -58,6 +59,26 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    @pytest.fixture(autouse=True)
+    def _pin_curated_list_to_the_in_repo_snapshot(self, monkeypatch):
+        """Keep these tests off the network.
+
+        ``fetch_openrouter_models`` intersects the live ``/v1/models`` payload
+        with a *curated* list, and that curated list is fetched from a remotely
+        hosted manifest (``get_curated_openrouter_models``). Patching only the
+        ``/v1/models`` request leaves the manifest call live, so these tests
+        silently depended on whatever the manifest happened to contain — they
+        began failing the day it stopped listing ``qwen/qwen3.7-max``.
+
+        Forcing the manifest to be unavailable pins the curated list to the
+        in-repo ``OPENROUTER_MODELS`` snapshot, which is what the assertions
+        below are written against.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            lambda *a, **k: None,
+        )
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
             def __enter__(self):

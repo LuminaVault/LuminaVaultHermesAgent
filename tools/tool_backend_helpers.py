@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -180,3 +181,65 @@ def fal_key_is_configured() -> bool:
         except Exception:
             value = None
     return bool(value and value.strip())
+
+
+# ---------------------------------------------------------------------------
+# Audio provider failure classification (shared by STT and TTS)
+# ---------------------------------------------------------------------------
+
+#: Failure classes worth telling the user about, rather than only logging.
+#: A transient upstream blip should stay quiet; being out of credits should
+#: not, because the user can act on it and will otherwise just watch voice
+#: quietly stop working.
+AUDIO_ERROR_KIND_QUOTA = "quota"
+AUDIO_ERROR_KIND_RATE_LIMIT = "rate_limit"
+AUDIO_ERROR_KIND_AUTH = "auth"
+AUDIO_ERROR_KIND_UPSTREAM = "upstream"
+
+AUDIO_USER_FACING_ERROR_KINDS = frozenset({
+    AUDIO_ERROR_KIND_QUOTA,
+    AUDIO_ERROR_KIND_RATE_LIMIT,
+    AUDIO_ERROR_KIND_AUTH,
+})
+
+
+def classify_audio_status(status_code) -> str:
+    """Map an HTTP status from an audio provider to an error kind."""
+    if status_code == 402:
+        return AUDIO_ERROR_KIND_QUOTA
+    if status_code == 429:
+        return AUDIO_ERROR_KIND_RATE_LIMIT
+    if status_code in (401, 403):
+        return AUDIO_ERROR_KIND_AUTH
+    return AUDIO_ERROR_KIND_UPSTREAM
+
+
+def classify_audio_exception(exc: BaseException) -> str:
+    """Classify a provider exception without knowing which SDK raised it.
+
+    Three shapes occur across the providers we call, and none of them share a
+    base class:
+
+    - ``openai.APIStatusError`` carries ``status_code`` directly.
+    - ``requests.HTTPError`` carries ``response.status_code``.
+    - Gemini's TTS path raises a bare ``RuntimeError`` whose message embeds
+      ``(HTTP 429)`` and nothing else — so the text is the only signal there.
+
+    Falls back to ``upstream`` when no status can be recovered, which keeps an
+    unrecognised failure quiet rather than guessing at a cause the user would
+    then act on.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status is None:
+        match = re.search(r"HTTP (\d{3})", str(exc))
+        if match:
+            status = int(match.group(1))
+    if status is None:
+        return AUDIO_ERROR_KIND_UPSTREAM
+    try:
+        return classify_audio_status(int(status))
+    except (TypeError, ValueError):
+        return AUDIO_ERROR_KIND_UPSTREAM

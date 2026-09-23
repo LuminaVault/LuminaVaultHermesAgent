@@ -402,6 +402,14 @@ gateway:
     label_all:             "TTS (voice reply to all messages)"
     help:                  "{toggle}\n\n**How /voice works**\n• `/voice on` — voice reply when you send a voice message\n• `/voice tts` — voice reply to *every* message\n• `/voice off` — back to text-only replies\n• `/voice status` — show the current mode\n• `/voice` (no argument) — quick toggle between on and off{channels}"
     help_channels:         "\n\n**Live voice channels (Discord)**\n• Join a voice channel first, then `/voice channel` — I'll join, listen, and speak my replies\n• `/voice leave` — disconnect from the voice channel"
+    unavailable_quota:     "⚠️ I couldn't transcribe that — you've used your voice messages for today. It resets tomorrow."
+    unavailable_rate_limit: "⚠️ I couldn't transcribe that — too many voice messages just now. Try again in a minute."
+    unavailable_auth:      "⚠️ I couldn't transcribe that — voice isn't set up correctly for this account."
+    unavailable_reply_quota: "⚠️ I'll reply in text — the voice service is out of credit for now."
+    unavailable_reply_rate_limit: "⚠️ I'll reply in text — too many voice replies just now."
+    unavailable_reply_auth: "⚠️ I'll reply in text — spoken replies aren't set up correctly for this account."
+    status_stt_ok:         "Transcription: available"
+    status_stt_off:        "Transcription: off (stt.enabled is false)"
 
   yolo:
     disabled:                   "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."
