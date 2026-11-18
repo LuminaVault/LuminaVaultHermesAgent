@@ -72,6 +72,12 @@ dashboard web server, which the cluster does not run.
 Files: `hermes_cli/profile_sessions.py` (new), handlers and routes in
 `gateway/platforms/api_server.py`. Tests: `tests/gateway/test_api_server_profiles.py`.
 
+The messages route names its variable `{profile_name}`, not `{profile}`: since
+0.23 `connect()` mirrors every route under `/p/{profile}/`, and a second
+`{profile}` group is an invalid pattern that stops the API server from starting.
+Any route added here must avoid the `profile` variable name too;
+`test_full_route_table_registers_with_profile_mirrors` checks the whole table.
+
 ### Voice: STT/TTS failure notices, channel attribution, `base_url`
 
 - **Failure classification** (`tools/tool_backend_helpers.py`:
