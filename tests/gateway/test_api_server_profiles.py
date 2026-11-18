@@ -17,16 +17,30 @@ from hermes_cli import profile_sessions
 from hermes_state import SessionDB
 
 
+_OURS = ("_handle_instance", "_handle_profiles_sessions", "_handle_profile_session_messages")
+
+
+def _register(app: web.Application, routes) -> None:
+    # Exactly what APIServerAdapter.connect() does: each native route plus its /p/<profile>/ mirror.
+    for method, path, handler in routes:
+        app.router.add_route(method, path, handler)
+        app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+
+
 def _make_app(api_key: str = "sk-secret") -> web.Application:
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": api_key}))
     app = web.Application()
-    app.router.add_get("/api/instance", adapter._handle_instance)
-    app.router.add_get("/api/profiles/sessions", adapter._handle_profiles_sessions)
-    app.router.add_get(
-        "/api/profiles/{profile}/sessions/{session_id}/messages",
-        adapter._handle_profile_session_messages,
-    )
+    _register(app, [r for r in adapter._http_route_table() if r[2].__name__ in _OURS])
     return app
+
+
+def test_full_route_table_registers_with_profile_mirrors():
+    """connect() mirrors every route under /p/{profile}; a route that names its own {profile}
+    variable compiles to a duplicate regex group and the API server refuses to start."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-secret"}))
+    routes = adapter._http_route_table()
+    assert {r[2].__name__ for r in routes} >= set(_OURS)
+    _register(web.Application(), routes)
 
 
 AUTH = {"Authorization": "Bearer sk-secret"}

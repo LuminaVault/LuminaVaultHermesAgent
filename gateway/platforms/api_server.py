@@ -1582,7 +1582,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # one API key reports every profile on this machine.
             ("GET", "/api/instance", self._handle_instance),
             ("GET", "/api/profiles/sessions", self._handle_profiles_sessions),
-            ("GET", "/api/profiles/{profile}/sessions/{session_id}/messages", self._handle_profile_session_messages),
+            # {profile_name}, not {profile}: connect() mirrors every route under /p/{profile}/, and a
+            # second {profile} group makes the pattern invalid, so the API server would not start.
+            ("GET", "/api/profiles/{profile_name}/sessions/{session_id}/messages",
+             self._handle_profile_session_messages),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -2705,13 +2708,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         })
 
     async def _handle_profile_session_messages(self, request: "web.Request") -> "web.Response":
-        """GET /api/profiles/{profile}/sessions/{session_id}/messages — the log."""
+        """GET /api/profiles/{profile_name}/sessions/{session_id}/messages — the log."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         from hermes_cli import profile_sessions
 
-        profile = request.match_info["profile"]
+        profile = request.match_info["profile_name"]
         session_id = request.match_info["session_id"]
         try:
             found = await asyncio.to_thread(profile_sessions.session_messages, profile, session_id)
