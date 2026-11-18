@@ -43,11 +43,11 @@ jobs:
     name: Python lints
     # A frontend-only push has nothing to check here (the ratchet is PR-only).
     if: inputs.python || inputs.event_name == 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v1
         with:
           ref: ${{ inputs.commit }}
           # Full history: the diff's merge base + base worktree, and the ratchet's HEAD^1 (the

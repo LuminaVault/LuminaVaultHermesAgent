@@ -116,6 +116,16 @@ starts its configs from an empty chain.
   `ghcr.io/luminavault/luminavault-hermes-agent:sha-*`.
 - `.gitignore`: `!website/src/data/`, which the first import lost to the bare
   `data/` rule.
+- `.github/`: upstream runs CI on Blacksmith runners and GitHub's large
+  runners, which this organisation does not have, so every job queued forever.
+  Labels are mapped to GitHub-hosted ones (`blacksmith-*-ubuntu-2404[-arm]` →
+  `ubuntu-24.04[-arm]`, `*-windows-2025` → `windows-2025`, `*-macos-*` →
+  `macos-*`, `windows-latest-32-core` → `windows-latest`, `…-arm-core` →
+  `windows-11-arm`), and `useblacksmith/checkout`, `setup-docker-builder` and
+  `build-push-action` are swapped for `actions/checkout`,
+  `docker/setup-buildx-action` and `docker/build-push-action`. Re-apply after
+  every re-import:
+  `grep -rlE 'blacksmith|windows-latest-32' .github`.
 
 Dropped at this re-import because upstream fixed or superseded them: the
 first import's CI repairs, its dependency pins (upstream's lockfiles are newer;
