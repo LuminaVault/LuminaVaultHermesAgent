@@ -1,31 +1,410 @@
+diff --git a/.github/workflows/luminavault-image.yml b/.github/workflows/luminavault-image.yml
+new file mode 100644
+index 0000000000..8745fa874b
+--- /dev/null
++++ b/.github/workflows/luminavault-image.yml
+@@ -0,0 +1,47 @@
++name: LuminaVault Hermes Image
++
++on:
++  push:
++    branches: [main]
++    paths:
++      - Dockerfile
++      - gateway/**
++      - agent/**
++      - hermes_cli/**
++      - pyproject.toml
++      - uv.lock
++      - .github/workflows/luminavault-image.yml
++  workflow_dispatch:
++
++permissions:
++  contents: read
++  packages: write
++
++concurrency:
++  group: luminavault-hermes-image-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    timeout-minutes: 60
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
++      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
++        with:
++          registry: ghcr.io
++          username: ${{ github.actor }}
++          password: ${{ secrets.GITHUB_TOKEN }}
++      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
++        with:
++          context: .
++          file: Dockerfile
++          platforms: linux/amd64
++          push: true
++          tags: |
++            ghcr.io/luminavault/luminavault-hermes-agent:main
++            ghcr.io/luminavault/luminavault-hermes-agent:sha-${{ github.sha }}
++          labels: org.opencontainers.image.revision=${{ github.sha }}
++          cache-from: type=gha,scope=luminavault-hermes-amd64
++          cache-to: type=gha,mode=max,scope=luminavault-hermes-amd64
+diff --git a/.github/workflows/osv-scanner.yml b/.github/workflows/osv-scanner.yml
+index 1bd270ccd7..956eadf2c7 100644
+--- a/.github/workflows/osv-scanner.yml
++++ b/.github/workflows/osv-scanner.yml
+@@ -37,7 +37,7 @@ permissions:
+ jobs:
+   scan:
+     name: Scan lockfiles
+-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
++    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+     with:
+       # Scan explicit lockfiles rather than recursing, so we only look at
+       # the five sources of truth and skip vendored / test / worktree dirs.
+diff --git a/.gitignore b/.gitignore
+index aa9b27899a..8fbefad523 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -40,6 +40,8 @@ data/
+ # The Connectors page's wire layer (apps/desktop/src/app/capabilities/connectors/data/)
+ # — same reason: the bare `data/` pattern above would otherwise swallow it.
+ !apps/desktop/src/app/capabilities/connectors/data/
++# LuminaVault fork: the docs site data, which the bare `data/` swallowed in the first import.
++!website/src/data/
+ .pytest_cache/
+ test_durations.json
+ .pytest-cache/
+diff --git a/gateway/platforms/api_run_terminal.py b/gateway/platforms/api_run_terminal.py
+new file mode 100644
+index 0000000000..ff4481addf
+--- /dev/null
++++ b/gateway/platforms/api_run_terminal.py
+@@ -0,0 +1,268 @@
++"""Terminal output on the ``/v1/runs`` event stream (LuminaVault addition).
++
++Upstream's desktop app shows an agent's terminal live, but only over the
++``tui_gateway`` WebSocket: ``process_registry.on_output`` is wired by
++``tui_gateway`` alone, and ``/v1/runs`` drops the terminal tool's command and
++result on the floor. A client that drives Hermes through ``/v1/runs`` -- which
++is every LuminaVault client -- therefore had no way to see what the agent ran
++or what it printed.
++
++This module adds three things to the run stream, and nothing else:
++
++* ``tool.started`` for the terminal tool carries ``command`` and
++  ``background``.
++* ``tool.completed`` for the terminal tool carries the tail of ``output``,
++  ``exit_code`` and ``output_truncated``.
++* A background process spawned by a run streams ``terminal.output`` events
++  ``{process_id, chunk}`` to that run, coalesced.
++
++Coalescing is not an optimisation. Consumers persist every run event -- the
++LuminaVault server writes one Postgres row per event -- and a process reader
++thread can hand over a chunk per line. So chunks are buffered per process and
++flushed at most every ``FLUSH_INTERVAL`` seconds or ``FLUSH_CHARS`` characters,
++and a run stops streaming after ``MAX_STREAM_CHARS`` with one
++``truncated: true`` marker, rather than turning ``yes`` into a million rows.
++
++Everything that leaves here goes through ``redact_sensitive_text(force=True)``,
++as ``subagent.*`` free text already does: terminal output is the most likely
++place for a token to appear. Redaction runs on coalesced chunks, so a secret is
++only missed if it straddles a flush boundary.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import threading
++import time
++from typing import Any, Callable, Dict, Optional
++
++logger = logging.getLogger(__name__)
++
++from agent.redact import redact_sensitive_text
++
++#: Tools whose command and output are surfaced. Only the shell: other tools'
++#: results are structured data, not a terminal.
++TERMINAL_TOOLS = frozenset({"terminal"})
++
++#: Tail kept from a finished command's output. The head of a long build is
++#: rarely what anyone needs; the error at the end is.
++MAX_OUTPUT_CHARS = 16_000
++
++#: Background output a single run may stream before it stops.
++MAX_STREAM_CHARS = 256_000
++
++FLUSH_INTERVAL = 0.25
++FLUSH_CHARS = 4_096
++
++Push = Callable[[Dict[str, Any]], None]
++
++
++def _redact(text: str) -> str:
++    return redact_sensitive_text(text, force=True)
++
++
++def started_fields(tool_name: Optional[str], args: Any) -> Dict[str, Any]:
++    """Extra ``tool.started`` fields for a terminal call, else ``{}``."""
++    if tool_name not in TERMINAL_TOOLS or not isinstance(args, dict):
++        return {}
++    command = args.get("command")
++    if not isinstance(command, str) or not command:
++        return {}
++    return {"command": _redact(command), "background": bool(args.get("background"))}
++
++
++def completed_fields(tool_name: Optional[str], result: Any) -> Dict[str, Any]:
++    """Extra ``tool.completed`` fields for a terminal call, else ``{}``.
++
++    The terminal tool returns a JSON string with ``output`` and ``exit_code``.
++    Anything else -- a plain-text error, a blocked call -- is passed through
++    as output with no exit code rather than guessed at.
++    """
++    if tool_name not in TERMINAL_TOOLS or result is None:
++        return {}
++    output: Any = result
++    exit_code: Optional[int] = None
++    if isinstance(result, str):
++        try:
++            parsed = json.loads(result)
++        except (ValueError, TypeError):
++            parsed = None
++        if isinstance(parsed, dict):
++            output = parsed.get("output", "")
++            code = parsed.get("exit_code")
++            exit_code = code if isinstance(code, int) and not isinstance(code, bool) else None
++    text = output if isinstance(output, str) else json.dumps(output, default=str)
++    truncated = len(text) > MAX_OUTPUT_CHARS
++    if truncated:
++        text = text[-MAX_OUTPUT_CHARS:]
++    fields: Dict[str, Any] = {"output": _redact(text), "output_truncated": truncated}
++    if exit_code is not None:
++        fields["exit_code"] = exit_code
++    return fields
++
++
++class _Route:
++    """One run's background output: per-process buffers and a budget."""
++
++    def __init__(self, push: Push, clock: Callable[[], float]):
++        self.push = push
++        self.clock = clock
++        self.buffers: Dict[str, str] = {}
++        self.first_buffered_at: Dict[str, float] = {}
++        self.streamed = 0
++        self.exhausted = False
++        self.timer: Optional[threading.Timer] = None
++
++
++class RunTerminalRouter:
++    """Routes ``process_registry`` output to the run that spawned the process.
++
++    Keyed by the process's ``session_key``. ``/v1/runs`` binds each run's
++    approval session key to its ``run_id`` and the terminal tool stamps a
++    spawned process with the current session key, so the key is the run.
++    ``task_id`` would not do: the terminal tool collapses it to the shared
++    container key (``"default"``), which every run has.
++    """
++
++    def __init__(
++        self,
++        *,
++        clock: Callable[[], float] = time.monotonic,
++        timer_factory: Callable[[float, Callable[[], None]], Any] = threading.Timer,
++    ):
++        self._routes: Dict[str, _Route] = {}
++        self._lock = threading.Lock()
++        self._clock = clock
++        self._timer_factory = timer_factory
++        self._previous_sink: Optional[Callable[[Any, str], None]] = None
++
++    def install(self, registry: Any) -> None:
++        """Hook the registry's live-output sink, chaining any sink already set
++        so a co-hosted driver (the desktop gateway) keeps working."""
++        existing = getattr(registry, "on_output", None)
++        if existing == self.on_output:
++            return
++        self._previous_sink = existing
++        registry.on_output = self.on_output
++
++    def register(self, run_key: str, push: Push) -> None:
++        if not run_key:
++            return
++        with self._lock:
++            self._routes[run_key] = _Route(push, self._clock)
++
++    def unregister(self, run_key: str) -> None:
++        """Flushes what is buffered, then stops routing. Output a process
++        writes after its run has ended has nowhere to go and is dropped."""
++        with self._lock:
++            route = self._routes.pop(run_key, None)
++            if route is None:
++                return
++            self._cancel_timer(route)
++            events = self._drain(route)
++        for event in events:
++            self._safe_push(route, event)
++
++    def on_output(self, session: Any, chunk: str) -> None:
++        previous = self._previous_sink
++        if previous is not None:
++            try:
++                previous(session, chunk)
++            except Exception:
++                pass
++        if not chunk:
++            return
++        run_key = str(getattr(session, "session_key", "") or "")
++        process_id = str(getattr(session, "id", "") or "")
++        if not run_key or not process_id:
++            return
++        events = []
++        with self._lock:
++            route = self._routes.get(run_key)
++            if route is None or route.exhausted:
++                return
++            if process_id not in route.buffers:
++                route.buffers[process_id] = ""
++                route.first_buffered_at[process_id] = route.clock()
++            route.buffers[process_id] += chunk
++            size = len(route.buffers[process_id])
++            age = route.clock() - route.first_buffered_at[process_id]
++            if size >= FLUSH_CHARS or age >= FLUSH_INTERVAL:
++                events = self._drain(route)
++                self._cancel_timer(route)
++            elif route.timer is None:
++                route.timer = self._timer_factory(FLUSH_INTERVAL, lambda: self._flush_key(run_key))
++                try:
++                    route.timer.daemon = True
++                except Exception:
++                    pass
++                route.timer.start()
++        for event in events:
++            self._safe_push(route, event)
++
++    def _flush_key(self, run_key: str) -> None:
++        with self._lock:
++            route = self._routes.get(run_key)
++            if route is None:
++                return
++            route.timer = None
++            events = self._drain(route)
++        for event in events:
++            self._safe_push(route, event)
++
++    def _drain(self, route: _Route) -> list:
++        """Buffered chunks as events, within the run's budget. Caller holds
++        the lock; pushing happens outside it."""
++        events = []
++        for process_id, text in list(route.buffers.items()):
++            if route.exhausted:
++                break
++            if not text:
++                continue
++            remaining = MAX_STREAM_CHARS - route.streamed
++            if remaining <= 0 and not route.exhausted:
++                route.exhausted = True
++                events.append({"process_id": process_id, "chunk": "", "truncated": True})
++                break
++            if len(text) > remaining:
++                text = text[:remaining]
++            route.streamed += len(text)
++            events.append({"process_id": process_id, "chunk": _redact(text)})
++            if route.streamed >= MAX_STREAM_CHARS and not route.exhausted:
++                route.exhausted = True
++                events.append({"process_id": process_id, "chunk": "", "truncated": True})
++        route.buffers.clear()
++        route.first_buffered_at.clear()
++        return events
++
++    @staticmethod
++    def _cancel_timer(route: _Route) -> None:
++        if route.timer is not None:
++            try:
++                route.timer.cancel()
++            except Exception:
++                pass
++            route.timer = None
++
++    @staticmethod
++    def _safe_push(route: _Route, fields: Dict[str, Any]) -> None:
++        try:
++            route.push({"event": "terminal.output", "timestamp": time.time(), **fields})
++        except Exception:
++            pass
++
++
++def router_for(adapter: Any) -> "RunTerminalRouter":
++    """The adapter's router, created and hooked into ``process_registry`` on first use."""
++    router = getattr(adapter, "_run_terminal_router", None)
++    if router is None:
++        router = RunTerminalRouter()
++        try:
++            from tools.process_registry import process_registry
++            router.install(process_registry)
++        except Exception:
++            logger.debug("run terminal router not installed", exc_info=True)
++        adapter._run_terminal_router = router
++    return router
++
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index a66cb6d29d..20528671aa 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -1544,6 +1544,13 @@
-                 "memory_write_api": False,
-                 "skills_api": True,
-                 "audio_api": False,
-+                "multimodal_ingestion": True,
-+                "ingestion_api": True,
-+                "ingestion_remote_source_url": True,
-+                "ingestion_supported_mime_types": [
-+                    "application/pdf", "text/*", "image/*", "audio/*", "video/*",
-+                ],
-+                "ingestion_max_source_bytes": 2147483648,
-                 "realtime_voice": False,
-                 "session_continuity_header": "X-Hermes-Session-Id",
-                 "session_key_header": "X-Hermes-Session-Key",
-@@ -1555,6 +1562,7 @@
-                 "models": {"method": "GET", "path": "/v1/models"},
-                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
-                 "responses": {"method": "POST", "path": "/v1/responses"},
-+                "ingestion": {"method": "POST", "path": "/v1/ingestions"},
-                 "runs": {"method": "POST", "path": "/v1/runs"},
-                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
-                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
-@@ -1574,6 +1582,62 @@
-             },
+@@ -53,7 +53,12 @@ _STATIC_FEATURE_FLAGS = {
+     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
+     "reasoning_streaming": True,
+     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
+-    "skills_api": True, "audio_api": False, "realtime_voice": False,
++    "skills_api": True, "audio_api": False,
++    # LuminaVault: the multimodal ingestion API (POST /v1/ingestions).
++    "multimodal_ingestion": True, "ingestion_api": True, "ingestion_remote_source_url": True,
++    "ingestion_supported_mime_types": ["application/pdf", "text/*", "image/*", "audio/*", "video/*"],
++    "ingestion_max_source_bytes": 2147483648,
++    "realtime_voice": False,
+     "session_continuity_header": "X-Hermes-Session-Id",
+     "session_key_header": "X-Hermes-Session-Key"}
+ # /v1/capabilities "endpoints" table: name -> (method, path[, feature]). An entry naming a
+@@ -62,7 +67,9 @@ _CAPABILITY_ENDPOINTS = (
+     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
+     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
+     ("chat_completions", ("POST", "/v1/chat/completions")),
+-    ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
++    ("responses", ("POST", "/v1/responses")),
++    ("ingestion", ("POST", "/v1/ingestions")),  # LuminaVault
++    ("runs", ("POST", "/v1/runs")),
+     ("run_status", ("GET", "/v1/runs/{run_id}")),
+     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
+     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
+@@ -1558,6 +1565,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             ("GET", "/v1/models", self._handle_models),
+             ("GET", "/api/model/options", self._handle_model_options),
+             ("GET", "/v1/capabilities", self._handle_capabilities),
++            ("POST", "/v1/ingestions", self._handle_ingestion),  # LuminaVault
+             ("GET", "/v1/skills", self._handle_skills),
+             ("GET", "/v1/toolsets", self._handle_toolsets),
+             ("GET", "/api/sessions", self._handle_list_sessions),
+@@ -1570,6 +1578,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
+             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
++            # LuminaVault: cross-profile, read-only views for remote dashboards (the Agents page):
++            # one API key reports every profile on this machine.
++            ("GET", "/api/instance", self._handle_instance),
++            ("GET", "/api/profiles/sessions", self._handle_profiles_sessions),
++            ("GET", "/api/profiles/{profile}/sessions/{session_id}/messages", self._handle_profile_session_messages),
+             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+             ("POST", "/v1/responses", self._handle_responses),
+             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
+@@ -2378,6 +2391,64 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
          })
  
+     @_require_auth
++    # LuminaVault: the multimodal ingestion API (POST /v1/ingestions).
 +    async def _handle_ingestion(self, request: "web.Request") -> "web.Response":
 +        """Analyze a remotely hosted multimodal source with the normal agent toolset."""
 +        auth_err = self._check_auth(request)
@@ -82,42 +461,1131 @@
 +            )
 +        return web.json_response({"object": "hermes.ingestion.result", "analysis": analysis, "usage": usage})
 +
-     async def _handle_skills(self, request: "web.Request") -> "web.Response":
-         """GET /v1/skills — list installed skills visible to the API-server agent.
++
+     async def _handle_skills(self, request: web.Request) -> web.Response:
+         """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
+         category), the same set ``/skills list`` shows."""
+@@ -2571,6 +2642,94 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             "limit": limit, "offset": offset, "has_more": windowed >= limit})
  
-@@ -4845,6 +4909,7 @@
-             self._app.router.add_get("/v1/health", self._handle_health)
-             self._app.router.add_get("/v1/models", self._handle_models)
-             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
-+            self._app.router.add_post("/v1/ingestions", self._handle_ingestion)
-             self._app.router.add_get("/v1/skills", self._handle_skills)
-             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
-             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
+     @_require_auth
++    # LuminaVault: cross-profile read-only session views (hermes_cli.profile_sessions).
++    async def _handle_instance(self, request: "web.Request") -> "web.Response":
++        """GET /api/instance — who this Hermes is: host, profiles, version.
++
++        Connected platforms and readiness live in ``/health/detailed``; this
++        adds what a multi-instance dashboard needs to label and group rows.
++        """
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        import socket
++
++        from hermes_cli import __version__
++        from hermes_cli import profile_sessions
++        from hermes_cli.profiles import get_active_profile_name
++
++        try:
++            active = get_active_profile_name()
++        except Exception:
++            active = "default"
++        return web.json_response({
++            "object": "hermes.instance",
++            "hostname": socket.gethostname(),
++            "version": __version__,
++            "profile": active,
++            "profiles": profile_sessions.profile_names(),
++        })
++
++    async def _handle_profiles_sessions(self, request: "web.Request") -> "web.Response":
++        """GET /api/profiles/sessions — sessions from every profile, newest first.
++
++        Read-only. ``profile`` narrows to one profile; ``source`` to one
++        platform (telegram, discord, api_server, cron, …). Rows carry
++        ``profile`` and ``is_active``.
++        """
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        from hermes_cli import profile_sessions
++
++        limit = self._parse_nonnegative_int(request.query.get("limit"), default=50, maximum=200)
++        offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=100_000)
++        try:
++            result = await asyncio.to_thread(
++                profile_sessions.list_sessions,
++                limit=limit,
++                offset=offset,
++                source=request.query.get("source") or None,
++                profile=request.query.get("profile") or None,
++                project=self._session_response,
++            )
++        except profile_sessions.UnknownProfileError as exc:
++            return web.json_response(_openai_error(str(exc), code="profile_not_found"), status=404)
++        return web.json_response({
++            "object": "list",
++            "data": result["data"],
++            "limit": limit,
++            "offset": offset,
++            "has_more": result["has_more"],
++            "errors": result["errors"],
++        })
++
++    async def _handle_profile_session_messages(self, request: "web.Request") -> "web.Response":
++        """GET /api/profiles/{profile}/sessions/{session_id}/messages — the log."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        from hermes_cli import profile_sessions
++
++        profile = request.match_info["profile"]
++        session_id = request.match_info["session_id"]
++        try:
++            found = await asyncio.to_thread(profile_sessions.session_messages, profile, session_id)
++        except profile_sessions.UnknownProfileError as exc:
++            return web.json_response(_openai_error(str(exc), code="profile_not_found"), status=404)
++        if found is None:
++            return web.json_response(
++                _openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404
++            )
++        resolved_id, messages = found
++        return web.json_response({
++            "object": "list",
++            "profile": profile,
++            "session_id": resolved_id,
++            "data": [self._message_response(m) for m in messages],
++        })
++
++
+     async def _handle_create_session(self, request: web.Request) -> web.Response:
+         """POST /api/sessions -- create an empty Hermes session row. Existence check, insert and
+         title handling run as ONE off-loop write so concurrent same-id creates can't both 201."""
+diff --git a/gateway/platforms/api_server_runs.py b/gateway/platforms/api_server_runs.py
+index 62284dd19e..3cb1437a7e 100644
+--- a/gateway/platforms/api_server_runs.py
++++ b/gateway/platforms/api_server_runs.py
+@@ -26,6 +26,7 @@ except ImportError:
+     # would reset the already-imported ``web`` to None (500 on POST /v1/runs).
+     RequestKey = None  # type: ignore[assignment,misc]
+ 
++from gateway.platforms import api_run_terminal as _run_terminal  # LuminaVault
+ from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response, room_run_claims
+ from gateway.turn_executor import _UnboundedThreadExecutor
+ from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+@@ -386,7 +387,16 @@ def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop,
+             if event_type == "tool.completed":
+                 event_fields["preview"] = _tool_completed_preview(
+                     kwargs.get("result"), redact_sensitive_text)
++                # LuminaVault: the terminal output tail (api_run_terminal).
++                event_fields.update(_run_terminal.completed_fields(tool_name, kwargs.get("result")))
++            elif event_type == "tool.started":
++                # LuminaVault: the terminal command (api_run_terminal).
++                event_fields.update(_run_terminal.started_fields(tool_name, args))
+             _push(_run_event(run_id, event_type, **event_fields))
++        elif event_type == "terminal.output":
++            # LuminaVault: coalesced background-process output, pushed by RunTerminalRouter from
++            # process reader threads.
++            _push({"run_id": run_id, **(kwargs.get("event") or {})})
+         elif event_type in {"subagent.start", "subagent.complete"}:
+             event = _run_event(run_id, event_type)
+             if preview is not None:
+@@ -1137,14 +1147,22 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
+             served_runtime = ((usage or {}).get("runtime") if isinstance(usage, dict) else None) or (
+                 result.get("runtime") if isinstance(result, dict) else None) or {}
+         else:
++            tool_cb = self._make_run_event_callback(run_id, loop)
+             with self._profile_scope(run.request_profile):
+                 agent = self._create_agent(
+-                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
++                    stream_delta_callback=_text_cb, tool_progress_callback=tool_cb,
+                     interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+             self._active_run_agents[run_id] = agent
+             approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
+-            result, usage, served_runtime = await _submit_api_worker(
+-                loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
++            # LuminaVault: stream the background processes this run spawns. The terminal tool
++            # stamps a process with the current session key, which /v1/runs binds per run.
++            terminal_router = _run_terminal.router_for(self)
++            terminal_router.register(run.approval_session_key, lambda event: tool_cb("terminal.output", event=event))
++            try:
++                result, usage, served_runtime = await _submit_api_worker(
++                    loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
++            finally:
++                terminal_router.unregister(run.approval_session_key)
+         # Publish request metrics (daily counters + latency) with each completed run (#52323).
+         self._record_api_metrics(usage, time.perf_counter() - _run_started_at)
+         if not isinstance(result, dict):
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index fe57f8b995..5aedd56bf7 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -1555,9 +1555,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
+     async def _enrich_inbound_voice(
+         self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]
+     ) -> str:
++        _stt_error_kinds: list[str] = []
+         message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+-            message_text, audio_paths,
++            message_text, audio_paths, error_sink=_stt_error_kinds, channel=self._stt_channel(source),
+         )
++        # LuminaVault: tell the user when transcription failed for a reason they can act on (out of
++        # quota, rate limited, misconfigured). The LLM cannot: it only gets the neutral marker. Only
++        # actionable causes, debounced per chat and localized; a transient blip stays quiet.
++        await self._notify_voice_unavailable(event, source, _stt_error_kinds)
+         # Echo each successful transcript back immediately when configured so users can verify STT
+         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
+         # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
+diff --git a/gateway/run_inbound_transcription.py b/gateway/run_inbound_transcription.py
+index 795590678a..45ad292672 100644
+--- a/gateway/run_inbound_transcription.py
++++ b/gateway/run_inbound_transcription.py
+@@ -5,7 +5,8 @@ from __future__ import annotations
+ import asyncio
+ import logging
+ import os
+-from typing import Optional
++import time
++from typing import Any, Optional
+ 
+ from gateway.run_common import _UNSET
+ 
+@@ -17,12 +18,20 @@ class GatewayInboundTranscriptionMixin:
+     """STT enrichment and the once-only echo of pending voice transcripts."""
+ 
+     async def _enrich_message_with_transcription(
+-        self, user_text: str, audio_paths: list[str], clip_memo: Optional[dict] = None
++        self, user_text: str, audio_paths: list[str], clip_memo: Optional[dict] = None, *,
++        error_sink: Optional[list[str]] = None, channel: Optional[str] = None,
+     ) -> tuple[str, list[str]]:
+         """Transcribe voice clips with the configured STT provider and prepend the transcripts →
+         ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
+         failed or STT is disabled) let callers echo them back before the agent loop. ``clip_memo``
+-        (path → ``_transcribe_one_clip`` result) skips clips an earlier pass already transcribed."""
++        (path → ``_transcribe_one_clip`` result) skips clips an earlier pass already transcribed.
++
++        LuminaVault: ``error_sink``, when given, collects the ``error_kind`` of each failed clip
++        (``tools.transcription_tools.classify_stt_status``) so the caller can tell the user about an
++        actionable cause out of band; the LLM only ever sees the neutral marker. It is opt-in via a
++        mutable argument so existing callers are unchanged, and per call because sessions transcribe
++        concurrently. ``channel`` is the platform the clips arrived on, forwarded to STT for metering
++        attribution; advisory only."""
+         from gateway.run import _probe_audio_duration
+         audio_paths = list(dict.fromkeys(audio_paths))
+         if not getattr(self.config, "stt_enabled", True):
+@@ -52,6 +61,7 @@ class GatewayInboundTranscriptionMixin:
+                     logger.debug("Transcribing user voice: %s", path)
+                     transcript, note = await self._transcribe_one_clip(
+                         path, transcribe_audio, transcribe_audio_local_fallback,
++                        error_sink=error_sink, channel=channel,
+                     )
+                     if clip_memo is not None:
+                         clip_memo[path] = (transcript, note)
+@@ -92,14 +102,17 @@ class GatewayInboundTranscriptionMixin:
+         if clip_memo is None:
+             clip_memo = {}
+             event._gateway_pending_stt_clips = clip_memo
+-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths, clip_memo)
++        channel = self._stt_channel(getattr(event, "source", None))
++        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
++            text, audio_paths, clip_memo, channel=channel,
++        )
+         # A voice note merged in during the await dropped a cache that did not exist yet; re-run on
+         # the merged media rather than publish a transcript that silently omits the new note.
+         while self._pending_event_audio_paths(event) != audio_paths:
+             audio_paths = self._pending_event_audio_paths(event)
+             text = user_text if user_text is not None else (getattr(event, "text", "") or "")
+             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+-                text, audio_paths, clip_memo,
++                text, audio_paths, clip_memo, channel=channel,
+             )
+         event._gateway_pending_stt_text = enriched_text
+         event._gateway_pending_stt_transcripts = list(successful_transcripts)
+@@ -143,6 +156,67 @@ class GatewayInboundTranscriptionMixin:
+             logger.warning("%s transcription failed: %s", log_context, trans_exc)
+             return text, []
+ 
++    # --- LuminaVault: voice failure notices and STT channel attribution ---------------------------
++
++    #: How long to stay quiet after warning a chat that voice is unavailable. A user out of quota
++    #: often sends several voice notes before reading the reply; one warning is information, five
++    #: is noise.
++    _VOICE_NOTICE_COOLDOWN_SECONDS = 600
++
++    async def _notify_voice_unavailable(
++        self, event, source, error_kinds, direction: str = "stt",
++    ) -> None:
++        """Send one localized notice when voice failed for an actionable reason.
++
++        ``direction`` is ``"stt"`` for inbound transcription or ``"tts"`` for spoken replies; it
++        selects the message and scopes the cooldown, keyed ``<direction>:platform:chat_id`` (inbound
++        and outbound fail for different reasons, so a user told about one still hears about the
++        other). No-op when every failure was transient, when the chat was warned recently, or when
++        the platform adapter is unavailable. Never raises: a failed notice must not take down the
++        message that triggered it."""
++        if not error_kinds:
++            return
++        try:
++            from tools.tool_backend_helpers import (
++                AUDIO_ERROR_KIND_AUTH, AUDIO_ERROR_KIND_QUOTA, AUDIO_ERROR_KIND_RATE_LIMIT,
++                AUDIO_USER_FACING_ERROR_KINDS)
++        except ImportError:
++            return
++        # Quota outranks rate-limit outranks auth: report the most actionable.
++        kind = next((k for k in (AUDIO_ERROR_KIND_QUOTA, AUDIO_ERROR_KIND_RATE_LIMIT, AUDIO_ERROR_KIND_AUTH)
++                     if k in error_kinds), None)
++        if kind is None or kind not in AUDIO_USER_FACING_ERROR_KINDS:
++            return
++        sent_at = self.__dict__.setdefault("_voice_notice_sent_at", {})
++        chat_key = f"{direction}:{getattr(source, 'platform', None)}:{getattr(source, 'chat_id', None)}"
++        now = time.monotonic()
++        last = sent_at.get(chat_key)
++        if last is not None and (now - last) < self._VOICE_NOTICE_COOLDOWN_SECONDS:
++            return
++        from agent.i18n import t
++        suffix = "" if direction == "stt" else "_reply"
++        message = t(f"gateway.voice.unavailable{suffix}_{kind}")
++        try:
++            adapter = self._adapter_for_source(source)
++            if adapter is None:
++                return
++            metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
++            await adapter.send(source.chat_id, message, metadata=metadata)
++            sent_at[chat_key] = now
++        except Exception as exc:
++            logger.debug("Voice unavailable notice failed (non-fatal): %s", exc)
++
++    @staticmethod
++    def _stt_channel(source: Any) -> Optional[str]:
++        """Name the platform a clip arrived on, for STT metering attribution. Accepts anything with
++        ``.platform`` (a ``SessionSource`` or a ``MessageEvent``); None rather than raising when
++        unknown, since a voice note must still be transcribed when we cannot name its origin."""
++        platform = getattr(source, "platform", None)
++        if platform is None:
++            return None
++        value = getattr(platform, "value", platform)
++        return str(value) or None
++
+     _EMPTY_TEXT_PLACEHOLDER = "(The user sent a message with no text content)"
+ 
+     @classmethod
+@@ -160,9 +234,16 @@ class GatewayInboundTranscriptionMixin:
+         agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+         return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
+ 
+-    async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> tuple[Optional[str], str]:
++    async def _transcribe_one_clip(
++        self, path: str, transcribe_audio, transcribe_audio_local_fallback, *,
++        error_sink: Optional[list[str]] = None, channel: Optional[str] = None,
++    ) -> tuple[Optional[str], str]:
+         """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
+-        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
++        if channel:  # LuminaVault: only when known, so a transcribe_audio stand-in without it still works
++            result = await asyncio.to_thread(transcribe_audio, path, None, "gateway", channel=channel)
++        else:
++            result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
++        error_kind = None if result.get("success") else result.get("error_kind")
+         if not result.get("success"):
+             fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
+             if fallback.get("success"):
+@@ -170,6 +251,9 @@ class GatewayInboundTranscriptionMixin:
+                 result = fallback
+         if not result["success"]:
+             logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
++            # The marker is all the LLM sees; the reason goes to the caller (LuminaVault).
++            if error_sink is not None and error_kind:
++                error_sink.append(error_kind)
+             return None, self._untranscribed_audio_note(path)
+         transcript = result["transcript"]
+         # STT may return success=True with an empty/whitespace transcript (silence, cut-off);
+diff --git a/gateway/run_voice.py b/gateway/run_voice.py
+index 447dc431b4..5995521cd1 100644
+--- a/gateway/run_voice.py
++++ b/gateway/run_voice.py
+@@ -442,6 +442,10 @@ class GatewayVoiceMixin:
+             paths = [str(p) for p in candidates if p and os.path.isfile(p)]
+             if not result.get("success") or not paths:
+                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
++                # LuminaVault: the text reply is unaffected; say why the audio is missing when the
++                # cause is actionable (out of credit, rate limited, misconfigured).
++                if _kind := result.get("error_kind"):
++                    await self._notify_voice_unavailable(event, event.source, [_kind], direction="tts")
+                 return
+             actual_paths = paths
+             await self._deliver_voice_reply(event, actual_paths)
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index d5296795ed..9dfab554f2 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -715,6 +715,10 @@ class GatewaySlashCommandsMixin(
+             mode = self._voice_mode.get(voice_key, "off")
+             label = t(f"gateway.voice.label_{mode}") if mode in ("off", "voice_only", "all") else mode
+             lines = [t("gateway.voice.status_mode", label=label)]
++            # LuminaVault: voice mode is only half the story. With inbound transcription disabled the
++            # user can have `/voice on` and still see nothing happen when they speak; say so here.
++            _stt_on = bool(getattr(getattr(self, "config", None), "stt_enabled", True))
++            lines.append(t("gateway.voice.status_stt_ok" if _stt_on else "gateway.voice.status_stt_off"))
+             guild_id = self._get_guild_id(event)  # append voice channel info if connected
+             info = adapter.get_voice_channel_info(guild_id) if guild_id and hasattr(adapter, "get_voice_channel_info") else None
+             if info:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 59a9cc85b8..9b26be9dae 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -21,7 +21,16 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
+ DEFAULT_CONFIG = {
+     "model": "",
+     "providers": {},
+-    "fallback_providers": [],
++    # LuminaVault: a fresh install must never be a dead end. If the primary provider loses auth or
++    # runs out of credit, the chain walks to zero-cost OpenRouter slugs before it reaches a billable
++    # one. LuminaVault provisions one Hermes per tenant from a fresh PVC, so this default is what a
++    # new tenant inherits. Slugs verified against the OpenRouter models API on 2026-08-21. Requires
++    # OPENROUTER_API_KEY; without it the chain simply fails through.
++    "fallback_providers": [
++        {"provider": "openrouter", "model": "z-ai/glm-5.2:free"},
++        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
++        {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
++    ],
+     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
+     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
+     # of switching the turn to a fallback model.
+diff --git a/hermes_cli/profile_sessions.py b/hermes_cli/profile_sessions.py
+new file mode 100644
+index 0000000000..bc689d82e7
+--- /dev/null
++++ b/hermes_cli/profile_sessions.py
+@@ -0,0 +1,135 @@
++"""Read-only session views across every profile on this machine.
++
++The gateway API server serves one profile's ``state.db``. A VPS running
++several profiles (``default``, ``mac-mcp``, …) behind one API key needs to
++report all of them, so a remote dashboard can list every agent's sessions
++without a second process per profile.
++
++Each profile's ``state.db`` is opened read-only: these calls run on dashboard
++refreshes and must never DDL or write-lock another profile's live database.
++"""
++
++from __future__ import annotations
++
++import time
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Optional, Tuple
++
++# A session with no end and activity inside this window counts as live.
++ACTIVE_WINDOW_SECONDS = 300
++
++
++class UnknownProfileError(LookupError):
++    """The requested profile name is invalid or does not exist."""
++
++
++def profile_targets(profile: Optional[str] = None) -> List[Tuple[str, Path]]:
++    """``(name, home)`` for one named profile, or for every profile."""
++    from hermes_cli import profiles as profiles_mod
++
++    if profile and profile != "all":
++        try:
++            name = profiles_mod.normalize_profile_name(profile)
++            profiles_mod.validate_profile_name(name)
++        except ValueError as exc:
++            raise UnknownProfileError(str(exc)) from exc
++        if not profiles_mod.profile_exists(name):
++            raise UnknownProfileError(f"Profile '{name}' does not exist.")
++        return [(name, Path(profiles_mod.get_profile_dir(name)))]
++
++    try:
++        targets = [(info.name, Path(info.path)) for info in profiles_mod.list_profiles()]
++    except Exception:
++        targets = []
++    return targets or [("default", Path(profiles_mod.get_profile_dir("default")))]
++
++
++def profile_names() -> List[str]:
++    return [name for name, _ in profile_targets()]
++
++
++def _open_read_only(home: Path):
++    from hermes_state import SessionDB
++
++    db_path = home / "state.db"
++    if not db_path.exists():
++        return None
++    return SessionDB(db_path=db_path, read_only=True)
++
++
++def is_active(session: Dict[str, Any], now: Optional[float] = None) -> bool:
++    now = time.time() if now is None else now
++    last = session.get("last_active") or session.get("started_at") or 0
++    return session.get("ended_at") is None and (now - last) < ACTIVE_WINDOW_SECONDS
++
++
++def list_sessions(
++    *,
++    limit: int,
++    offset: int = 0,
++    source: Optional[str] = None,
++    profile: Optional[str] = None,
++    project: Callable[[Dict[str, Any]], Dict[str, Any]] = dict,
++) -> Dict[str, Any]:
++    """Sessions from every profile (or one), newest activity first.
++
++    Each row is ``project(row)`` tagged with ``profile`` and ``is_active``.
++    A profile whose database cannot be read is reported in ``errors``
++    instead of failing the whole list.
++    """
++    # Over-fetch per profile so the merged window is right for this page.
++    per_profile = min(limit + offset, 500)
++    merged: List[Dict[str, Any]] = []
++    errors: List[Dict[str, str]] = []
++    now = time.time()
++    for name, home in profile_targets(profile):
++        try:
++            db = _open_read_only(home)
++        except Exception as exc:
++            errors.append({"profile": name, "error": str(exc)})
++            continue
++        if db is None:
++            continue
++        try:
++            rows = db.list_sessions_rich(
++                source=source,
++                limit=per_profile,
++                offset=0,
++                include_children=False,
++                order_by_last_active=True,
++            )
++            for row in rows:
++                out = project(row)
++                out["profile"] = name
++                out["is_active"] = is_active(row, now)
++                merged.append(out)
++        except Exception as exc:
++            errors.append({"profile": name, "error": str(exc)})
++        finally:
++            db.close()
++
++    merged.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)
++    window = merged[offset:offset + limit]
++    return {
++        "data": window,
++        "has_more": len(merged) > offset + limit,
++        "errors": errors,
++    }
++
++
++def session_messages(profile: str, session_id: str) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
++    """``(resolved_session_id, messages)`` for a session in ``profile``.
++
++    ``None`` when that profile has no such session.
++    """
++    [(_, home)] = profile_targets(profile)
++    db = _open_read_only(home)
++    if db is None:
++        return None
++    try:
++        if not db.get_session(session_id):
++            return None
++        resolved = db.resolve_resume_session_id(session_id)
++        return resolved, db.get_messages(resolved)
++    finally:
++        db.close()
+diff --git a/locales/af.yaml b/locales/af.yaml
+index c90d988494..23cad157c4 100644
+--- a/locales/af.yaml
++++ b/locales/af.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (stemantwoord op alle boodskappe)"
+     help: "{toggle}\n\n**Hoe /voice werk**\n• `/voice on` — stemantwoord wanneer jy 'n stemboodskap stuur\n• `/voice tts` — stemantwoord op *elke* boodskap\n• `/voice off` — terug na slegs-teks antwoorde\n• `/voice status` — wys die huidige modus\n• `/voice` (geen argument) — wissel vinnig tussen aan en af{channels}"
+     help_channels: "\n\n**Lewendige stemkanale (Discord)**\n• Sluit eers by 'n stemkanaal aan, dan `/voice channel` — ek sluit aan, luister en praat my antwoorde\n• `/voice leave` — ontkoppel van die stemkanaal"
++    unavailable_quota: "⚠️ Ek kon dit nie transkribeer nie — jy het vandag se stemboodskappe opgebruik. Dit stel môre terug."
++    unavailable_rate_limit: "⚠️ Ek kon dit nie transkribeer nie — te veel stemboodskappe so pas. Probeer oor 'n minuut weer."
++    unavailable_auth: "⚠️ Ek kon dit nie transkribeer nie — stem is nie korrek vir hierdie rekening opgestel nie."
++    unavailable_reply_quota: "⚠️ Ek antwoord in teks — die stemdiens het nie meer krediet nie."
++    unavailable_reply_rate_limit: "⚠️ Ek antwoord in teks — te veel stemantwoorde so pas."
++    unavailable_reply_auth: "⚠️ Ek antwoord in teks — gesproke antwoorde is nie korrek opgestel nie."
++    status_stt_ok: "Transkripsie: beskikbaar"
++    status_stt_off: "Transkripsie: af (stt.enabled is vals)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Stemkanale word nie op hierdie platform ondersteun nie."
+     channel_guild_only: "Hierdie opdrag werk slegs in 'n Discord-bediener."
+diff --git a/locales/ar.yaml b/locales/ar.yaml
+index 80958dd20e..e90ea6bfbd 100644
+--- a/locales/ar.yaml
++++ b/locales/ar.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (رد صوتي على كل الرسائل)"
+     help: "{toggle}\n\n**كيف يعمل /voice**\n• `/voice on` — رد صوتي عند إرسال رسالة صوتية\n• `/voice tts` — رد صوتي على *كل* رسالة\n• `/voice off` — العودة إلى ردود نصّية فقط\n• `/voice status` — عرض الوضع الحالي\n• `/voice` (بدون وسيط) — تبديل سريع بين التفعيل والتعطيل{channels}"
+     help_channels: "\n\n**قنوات الصوت الحيّة (Discord)**\n• انضمّ إلى قناة صوتية أولًا، ثم `/voice channel` — سأنضمّ وأستمع وأنطق ردودي\n• `/voice leave` — قطع الاتصال بالقناة الصوتية"
++    unavailable_quota: "⚠️ I couldn't transcribe that — you've used your voice messages for today. It resets tomorrow."
++    unavailable_rate_limit: "⚠️ I couldn't transcribe that — too many voice messages just now. Try again in a minute."
++    unavailable_auth: "⚠️ I couldn't transcribe that — voice isn't set up correctly for this account."
++    unavailable_reply_quota: "⚠️ I'll reply in text — the voice service is out of credit for now."
++    unavailable_reply_rate_limit: "⚠️ I'll reply in text — too many voice replies just now."
++    unavailable_reply_auth: "⚠️ I'll reply in text — spoken replies aren't set up correctly for this account."
++    status_stt_ok: "Transcription: available"
++    status_stt_off: "Transcription: off (stt.enabled is false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "القنوات الصوتية غير مدعومة على هذه المنصة."
+     channel_guild_only: "يعمل هذا الأمر داخل خادم Discord فقط."
+diff --git a/locales/de.yaml b/locales/de.yaml
+index c0654952de..b7dd6b748f 100644
+--- a/locales/de.yaml
++++ b/locales/de.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (Sprachantwort auf alle Nachrichten)"
+     help: "{toggle}\n\n**So funktioniert /voice**\n• `/voice on` — Sprachantwort, wenn du eine Sprachnachricht sendest\n• `/voice tts` — Sprachantwort auf *jede* Nachricht\n• `/voice off` — zurück zu reinen Textantworten\n• `/voice status` — aktuellen Modus anzeigen\n• `/voice` (ohne Argument) — schnelles Umschalten zwischen an und aus{channels}"
+     help_channels: "\n\n**Live-Sprachkanäle (Discord)**\n• Tritt zuerst einem Sprachkanal bei, dann `/voice channel` — ich trete bei, höre zu und spreche meine Antworten\n• `/voice leave` — vom Sprachkanal trennen"
++    unavailable_quota: "⚠️ Ich konnte das nicht transkribieren — du hast deine Sprachnachrichten für heute aufgebraucht. Morgen gibt es wieder neue."
++    unavailable_rate_limit: "⚠️ Ich konnte das nicht transkribieren — gerade zu viele Sprachnachrichten. Versuch es in einer Minute noch einmal."
++    unavailable_auth: "⚠️ Ich konnte das nicht transkribieren — Sprache ist für dieses Konto nicht richtig eingerichtet."
++    unavailable_reply_quota: "⚠️ Ich antworte als Text — der Sprachdienst hat kein Guthaben mehr."
++    unavailable_reply_rate_limit: "⚠️ Ich antworte als Text — gerade zu viele Sprachantworten."
++    unavailable_reply_auth: "⚠️ Ich antworte als Text — gesprochene Antworten sind für dieses Konto nicht richtig eingerichtet."
++    status_stt_ok: "Transkription: verfügbar"
++    status_stt_off: "Transkription: aus (stt.enabled ist false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Sprachkanäle werden auf dieser Plattform nicht unterstützt."
+     channel_guild_only: "Dieser Befehl funktioniert nur in einem Discord-Server."
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 8170887068..dac40784c9 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -588,6 +588,14 @@ gateway:
+     label_all: "TTS (voice reply to all messages)"
+     help: "{toggle}\n\n**How /voice works**\n• `/voice on` — voice reply when you send a voice message\n• `/voice tts` — voice reply to *every* message\n• `/voice off` — back to text-only replies\n• `/voice status` — show the current mode\n• `/voice` (no argument) — quick toggle between on and off{channels}"
+     help_channels: "\n\n**Live voice channels (Discord)**\n• Join a voice channel first, then `/voice channel` — I'll join, listen, and speak my replies\n• `/voice leave` — disconnect from the voice channel"
++    unavailable_quota: "⚠️ I couldn't transcribe that — you've used your voice messages for today. It resets tomorrow."
++    unavailable_rate_limit: "⚠️ I couldn't transcribe that — too many voice messages just now. Try again in a minute."
++    unavailable_auth: "⚠️ I couldn't transcribe that — voice isn't set up correctly for this account."
++    unavailable_reply_quota: "⚠️ I'll reply in text — the voice service is out of credit for now."
++    unavailable_reply_rate_limit: "⚠️ I'll reply in text — too many voice replies just now."
++    unavailable_reply_auth: "⚠️ I'll reply in text — spoken replies aren't set up correctly for this account."
++    status_stt_ok: "Transcription: available"
++    status_stt_off: "Transcription: off (stt.enabled is false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Voice channels are not supported on this platform."
+     channel_guild_only: "This command only works in a Discord server."
+diff --git a/locales/es.yaml b/locales/es.yaml
+index 4b00392718..2b602c4221 100644
+--- a/locales/es.yaml
++++ b/locales/es.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (responder con voz a todos los mensajes)"
+     help: "{toggle}\n\n**Cómo funciona /voice**\n• `/voice on` — respuesta de voz cuando envías un mensaje de voz\n• `/voice tts` — respuesta de voz a *cada* mensaje\n• `/voice off` — volver a respuestas solo de texto\n• `/voice status` — mostrar el modo actual\n• `/voice` (sin argumento) — alternar rápido entre activado y desactivado{channels}"
+     help_channels: "\n\n**Canales de voz en vivo (Discord)**\n• Únete primero a un canal de voz, luego `/voice channel` — me uno, escucho y digo mis respuestas\n• `/voice leave` — desconectar del canal de voz"
++    unavailable_quota: "⚠️ No pude transcribir eso: has usado tus mensajes de voz de hoy. Se restablece mañana."
++    unavailable_rate_limit: "⚠️ No pude transcribir eso: demasiados mensajes de voz ahora mismo. Inténtalo de nuevo en un minuto."
++    unavailable_auth: "⚠️ No pude transcribir eso: la voz no está configurada correctamente para esta cuenta."
++    unavailable_reply_quota: "⚠️ Responderé en texto: el servicio de voz se ha quedado sin crédito."
++    unavailable_reply_rate_limit: "⚠️ Responderé en texto: demasiadas respuestas de voz ahora mismo."
++    unavailable_reply_auth: "⚠️ Responderé en texto: las respuestas habladas no están bien configuradas para esta cuenta."
++    status_stt_ok: "Transcripción: disponible"
++    status_stt_off: "Transcripción: desactivada (stt.enabled es false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Los canales de voz no son compatibles con esta plataforma."
+     channel_guild_only: "Este comando solo funciona en un servidor de Discord."
+diff --git a/locales/fr.yaml b/locales/fr.yaml
+index 470642dc16..2ba68d55d8 100644
+--- a/locales/fr.yaml
++++ b/locales/fr.yaml
+@@ -671,6 +671,14 @@ gateway:
+     label_all: "TTS (réponse vocale à tous les messages)"
+     help: "{toggle}\n\n**Comment fonctionne /voice**\n• `/voice on` — réponse vocale quand vous envoyez un message vocal\n• `/voice tts` — réponse vocale à *chaque* message\n• `/voice off` — retour aux réponses texte uniquement\n• `/voice status` — afficher le mode actuel\n• `/voice` (sans argument) — bascule rapide entre activé et désactivé{channels}"
+     help_channels: "\n\n**Salons vocaux en direct (Discord)**\n• Rejoignez d'abord un salon vocal, puis `/voice channel` — je rejoins, j'écoute et je parle mes réponses\n• `/voice leave` — se déconnecter du salon vocal"
++    unavailable_quota: "⚠️ Je n'ai pas pu transcrire ce message : vous avez utilisé vos messages vocaux du jour. Le quota est réinitialisé demain."
++    unavailable_rate_limit: "⚠️ Je n'ai pas pu transcrire ce message : trop de messages vocaux à la fois. Réessayez dans une minute."
++    unavailable_auth: "⚠️ Je n'ai pas pu transcrire ce message : la voix n'est pas correctement configurée pour ce compte."
++    unavailable_reply_quota: "⚠️ Je réponds en texte : le service vocal n'a plus de crédit."
++    unavailable_reply_rate_limit: "⚠️ Je réponds en texte : trop de réponses vocales à la fois."
++    unavailable_reply_auth: "⚠️ Je réponds en texte : les réponses vocales ne sont pas correctement configurées pour ce compte."
++    status_stt_ok: "Transcription : disponible"
++    status_stt_off: "Transcription : désactivée (stt.enabled est false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Les canaux vocaux ne sont pas pris en charge sur cette plateforme."
+     channel_guild_only: "Cette commande ne fonctionne que dans un serveur Discord."
+diff --git a/locales/ga.yaml b/locales/ga.yaml
+index 5e3e74086e..b5fe34b275 100644
+--- a/locales/ga.yaml
++++ b/locales/ga.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (freagra gutha do gach teachtaireacht)"
+     help: "{toggle}\n\n**Conas a oibríonn /voice**\n• `/voice on` — freagra gutha nuair a sheolann tú teachtaireacht gutha\n• `/voice tts` — freagra gutha do *gach* teachtaireacht\n• `/voice off` — ar ais go freagraí téacs amháin\n• `/voice status` — taispeáin an mód reatha\n• `/voice` (gan argóint) — scoránaigh go tapa idir air agus as{channels}"
+     help_channels: "\n\n**Cainéil gutha bheo (Discord)**\n• Téigh isteach i gcainéal gutha ar dtús, ansin `/voice channel` — téim isteach, éistim agus labhraím mo fhreagraí\n• `/voice leave` — dícheangail ón gcainéal gutha"
++    unavailable_quota: "⚠️ Níorbh fhéidir liom é sin a thraslitriú — tá teachtaireachtaí gutha an lae inniu úsáidte agat. Athshocrófar amárach é."
++    unavailable_rate_limit: "⚠️ Níorbh fhéidir liom é sin a thraslitriú — an iomarca teachtaireachtaí gutha faoi láthair. Bain triail eile as i gceann nóiméid."
++    unavailable_auth: "⚠️ Níorbh fhéidir liom é sin a thraslitriú — níl an guth socraithe i gceart don chuntas seo."
++    unavailable_reply_quota: "⚠️ Freagróidh mé i dtéacs — tá an tseirbhís gutha as creidmheas."
++    unavailable_reply_rate_limit: "⚠️ Freagróidh mé i dtéacs — an iomarca freagraí gutha faoi láthair."
++    unavailable_reply_auth: "⚠️ Freagróidh mé i dtéacs — níl freagraí labhartha socraithe i gceart don chuntas seo."
++    status_stt_ok: "Traslitriú: ar fáil"
++    status_stt_off: "Traslitriú: múchta (tá stt.enabled bréagach)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Ní thacaítear le cainéil ghutha ar an ardán seo."
+     channel_guild_only: "Ní oibríonn an t-ordú seo ach i bhfreastalaí Discord."
+diff --git a/locales/hu.yaml b/locales/hu.yaml
+index 994c7a853e..b17cca42d5 100644
+--- a/locales/hu.yaml
++++ b/locales/hu.yaml
+@@ -587,6 +587,14 @@ gateway:
+     label_all: "TTS (hangválasz minden üzenetre)"
+     help: "{toggle}\n\n**Hogyan működik a /voice**\n• `/voice on` — hangválasz, amikor hangüzenetet küldesz\n• `/voice tts` — hangválasz *minden* üzenetre\n• `/voice off` — vissza a csak szöveges válaszokhoz\n• `/voice status` — az aktuális mód megjelenítése\n• `/voice` (argumentum nélkül) — gyors váltás be és ki között{channels}"
+     help_channels: "\n\n**Élő hangcsatornák (Discord)**\n• Először lépj be egy hangcsatornába, majd `/voice channel` — csatlakozom, hallgatok és hangosan válaszolok\n• `/voice leave` — lecsatlakozás a hangcsatornáról"
++    unavailable_quota: "⚠️ Nem tudtam átírni — elhasználtad a mai hangüzeneteidet. Holnap alaphelyzetbe áll."
++    unavailable_rate_limit: "⚠️ Nem tudtam átírni — túl sok hangüzenet érkezett egyszerre. Próbáld újra egy perc múlva."
++    unavailable_auth: "⚠️ Nem tudtam átírni — a hang nincs helyesen beállítva ehhez a fiókhoz."
++    unavailable_reply_quota: "⚠️ Szövegben válaszolok — a hangszolgáltatásnak elfogyott a kerete."
++    unavailable_reply_rate_limit: "⚠️ Szövegben válaszolok — túl sok hangválasz érkezett egyszerre."
++    unavailable_reply_auth: "⚠️ Szövegben válaszolok — a hangos válaszok nincsenek helyesen beállítva ehhez a fiókhoz."
++    status_stt_ok: "Átírás: elérhető"
++    status_stt_off: "Átírás: kikapcsolva (az stt.enabled hamis)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Ezen a platformon nem támogatottak a hangcsatornák."
+     channel_guild_only: "Ez a parancs csak Discord-szerveren működik."
+diff --git a/locales/it.yaml b/locales/it.yaml
+index 60013cd10d..83ff8bb9fc 100644
+--- a/locales/it.yaml
++++ b/locales/it.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (risposta vocale a tutti i messaggi)"
+     help: "{toggle}\n\n**Come funziona /voice**\n• `/voice on` — risposta vocale quando invii un messaggio vocale\n• `/voice tts` — risposta vocale a *ogni* messaggio\n• `/voice off` — torna alle risposte solo testo\n• `/voice status` — mostra la modalità attuale\n• `/voice` (senza argomento) — alterna rapidamente tra attivo e disattivo{channels}"
+     help_channels: "\n\n**Canali vocali dal vivo (Discord)**\n• Entra prima in un canale vocale, poi `/voice channel` — mi unisco, ascolto e parlo le mie risposte\n• `/voice leave` — disconnetti dal canale vocale"
++    unavailable_quota: "⚠️ Non sono riuscito a trascriverlo: hai esaurito i messaggi vocali di oggi. Si azzera domani."
++    unavailable_rate_limit: "⚠️ Non sono riuscito a trascriverlo: troppi messaggi vocali in questo momento. Riprova tra un minuto."
++    unavailable_auth: "⚠️ Non sono riuscito a trascriverlo: la voce non è configurata correttamente per questo account."
++    unavailable_reply_quota: "⚠️ Rispondo in testo: il servizio vocale ha esaurito il credito."
++    unavailable_reply_rate_limit: "⚠️ Rispondo in testo: troppe risposte vocali in questo momento."
++    unavailable_reply_auth: "⚠️ Rispondo in testo: le risposte vocali non sono configurate correttamente per questo account."
++    status_stt_ok: "Trascrizione: disponibile"
++    status_stt_off: "Trascrizione: disattivata (stt.enabled è false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "I canali vocali non sono supportati su questa piattaforma."
+     channel_guild_only: "Questo comando funziona solo in un server Discord."
+diff --git a/locales/ja.yaml b/locales/ja.yaml
+index fa149f6010..64c1c1ecac 100644
+--- a/locales/ja.yaml
++++ b/locales/ja.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (すべてのメッセージに音声で返信)"
+     help: "{toggle}\n\n**/voice の使い方**\n• `/voice on` — 音声メッセージを送ると音声で返信\n• `/voice tts` — *すべての*メッセージに音声で返信\n• `/voice off` — テキストのみの返信に戻す\n• `/voice status` — 現在のモードを表示\n• `/voice`（引数なし）— オンとオフをすばやく切り替え{channels}"
+     help_channels: "\n\n**ライブ音声チャンネル (Discord)**\n• 先に音声チャンネルに参加してから `/voice channel` — 参加して聞き取り、音声で返信します\n• `/voice leave` — 音声チャンネルから切断"
++    unavailable_quota: "⚠️ 文字起こしできませんでした。本日分の音声メッセージを使い切りました。明日リセットされます。"
++    unavailable_rate_limit: "⚠️ 文字起こしできませんでした。音声メッセージが多すぎます。1分ほど待ってからお試しください。"
++    unavailable_auth: "⚠️ 文字起こしできませんでした。このアカウントでは音声が正しく設定されていません。"
++    unavailable_reply_quota: "⚠️ テキストで返信します。音声サービスのクレジットが不足しています。"
++    unavailable_reply_rate_limit: "⚠️ テキストで返信します。音声返信が多すぎます。"
++    unavailable_reply_auth: "⚠️ テキストで返信します。このアカウントでは音声返信が正しく設定されていません。"
++    status_stt_ok: "文字起こし: 利用可能"
++    status_stt_off: "文字起こし: オフ (stt.enabled が false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "このプラットフォームでは音声チャンネルはサポートされていません。"
+     channel_guild_only: "このコマンドは Discord サーバー内でのみ使えます。"
+diff --git a/locales/ko.yaml b/locales/ko.yaml
+index c303139969..6bc5c3d2c3 100644
+--- a/locales/ko.yaml
++++ b/locales/ko.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (모든 메시지에 음성으로 응답)"
+     help: "{toggle}\n\n**/voice 사용법**\n• `/voice on` — 음성 메시지를 보내면 음성으로 답변\n• `/voice tts` — *모든* 메시지에 음성으로 답변\n• `/voice off` — 텍스트 전용 답변으로 복귀\n• `/voice status` — 현재 모드 표시\n• `/voice` (인자 없음) — 켜기와 끄기를 빠르게 전환{channels}"
+     help_channels: "\n\n**라이브 음성 채널 (Discord)**\n• 먼저 음성 채널에 들어간 다음 `/voice channel` — 제가 참여해 듣고 음성으로 답변합니다\n• `/voice leave` — 음성 채널에서 연결 해제"
++    unavailable_quota: "⚠️ 받아쓰기를 할 수 없습니다. 오늘의 음성 메시지를 모두 사용했습니다. 내일 초기화됩니다."
++    unavailable_rate_limit: "⚠️ 받아쓰기를 할 수 없습니다. 지금 음성 메시지가 너무 많습니다. 1분 후에 다시 시도하세요."
++    unavailable_auth: "⚠️ 받아쓰기를 할 수 없습니다. 이 계정에 음성이 올바르게 설정되어 있지 않습니다."
++    unavailable_reply_quota: "⚠️ 텍스트로 답변합니다. 음성 서비스 크레딧이 소진되었습니다."
++    unavailable_reply_rate_limit: "⚠️ 텍스트로 답변합니다. 지금 음성 답변이 너무 많습니다."
++    unavailable_reply_auth: "⚠️ 텍스트로 답변합니다. 이 계정에 음성 답변이 올바르게 설정되어 있지 않습니다."
++    status_stt_ok: "받아쓰기: 사용 가능"
++    status_stt_off: "받아쓰기: 꺼짐 (stt.enabled가 false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "이 플랫폼에서는 음성 채널을 지원하지 않아요."
+     channel_guild_only: "이 명령은 Discord 서버에서만 동작해요."
+diff --git a/locales/pt.yaml b/locales/pt.yaml
+index 2cf555c093..561601a525 100644
+--- a/locales/pt.yaml
++++ b/locales/pt.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (resposta de voz a todas as mensagens)"
+     help: "{toggle}\n\n**Como funciona o /voice**\n• `/voice on` — resposta por voz quando envias uma mensagem de voz\n• `/voice tts` — resposta por voz a *todas* as mensagens\n• `/voice off` — voltar às respostas apenas em texto\n• `/voice status` — mostrar o modo atual\n• `/voice` (sem argumento) — alternar rapidamente entre ligado e desligado{channels}"
+     help_channels: "\n\n**Canais de voz ao vivo (Discord)**\n• Entra primeiro num canal de voz, depois `/voice channel` — eu entro, ouço e falo as minhas respostas\n• `/voice leave` — desligar do canal de voz"
++    unavailable_quota: "⚠️ Não consegui transcrever: usaste as tuas mensagens de voz de hoje. É reposto amanhã."
++    unavailable_rate_limit: "⚠️ Não consegui transcrever: demasiadas mensagens de voz agora. Tenta de novo daqui a um minuto."
++    unavailable_auth: "⚠️ Não consegui transcrever: a voz não está configurada corretamente para esta conta."
++    unavailable_reply_quota: "⚠️ Vou responder em texto — o serviço de voz ficou sem crédito."
++    unavailable_reply_rate_limit: "⚠️ Vou responder em texto — demasiadas respostas de voz agora."
++    unavailable_reply_auth: "⚠️ Vou responder em texto — as respostas faladas não estão bem configuradas para esta conta."
++    status_stt_ok: "Transcrição: disponível"
++    status_stt_off: "Transcrição: desligada (stt.enabled é false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Canais de voz não são suportados nesta plataforma."
+     channel_guild_only: "Este comando só funciona em um servidor do Discord."
+diff --git a/locales/ru.yaml b/locales/ru.yaml
+index 25022b56dc..06f2ce7085 100644
+--- a/locales/ru.yaml
++++ b/locales/ru.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (голосовой ответ на все сообщения)"
+     help: "{toggle}\n\n**Как работает /voice**\n• `/voice on` — голосовой ответ, когда вы отправляете голосовое сообщение\n• `/voice tts` — голосовой ответ на *каждое* сообщение\n• `/voice off` — вернуться к ответам только текстом\n• `/voice status` — показать текущий режим\n• `/voice` (без аргумента) — быстрое переключение между вкл и выкл{channels}"
+     help_channels: "\n\n**Живые голосовые каналы (Discord)**\n• Сначала зайдите в голосовой канал, затем `/voice channel` — я подключусь, буду слушать и отвечать голосом\n• `/voice leave` — отключиться от голосового канала"
++    unavailable_quota: "⚠️ Не удалось расшифровать — вы израсходовали голосовые сообщения на сегодня. Лимит обновится завтра."
++    unavailable_rate_limit: "⚠️ Не удалось расшифровать — слишком много голосовых сообщений сейчас. Попробуйте через минуту."
++    unavailable_auth: "⚠️ Не удалось расшифровать — голос настроен для этого аккаунта некорректно."
++    unavailable_reply_quota: "⚠️ Отвечу текстом — на голосовом сервисе закончились средства."
++    unavailable_reply_rate_limit: "⚠️ Отвечу текстом — сейчас слишком много голосовых ответов."
++    unavailable_reply_auth: "⚠️ Отвечу текстом — голосовые ответы настроены для этого аккаунта некорректно."
++    status_stt_ok: "Расшифровка: доступна"
++    status_stt_off: "Расшифровка: выключена (stt.enabled равно false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Голосовые каналы на этой платформе не поддерживаются."
+     channel_guild_only: "Эта команда работает только на сервере Discord."
+diff --git a/locales/tr.yaml b/locales/tr.yaml
+index fc00610f03..430da923a0 100644
+--- a/locales/tr.yaml
++++ b/locales/tr.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (tüm mesajlara sesli yanıt)"
+     help: "{toggle}\n\n**/voice nasıl çalışır**\n• `/voice on` — sesli mesaj gönderdiğinde sesli yanıt\n• `/voice tts` — *her* mesaja sesli yanıt\n• `/voice off` — yalnızca metin yanıtlarına dön\n• `/voice status` — geçerli modu göster\n• `/voice` (argümansız) — açık ve kapalı arasında hızlı geçiş{channels}"
+     help_channels: "\n\n**Canlı ses kanalları (Discord)**\n• Önce bir ses kanalına katıl, sonra `/voice channel` — katılırım, dinlerim ve yanıtlarımı sesli söylerim\n• `/voice leave` — ses kanalından ayrıl"
++    unavailable_quota: "⚠️ Bunu yazıya dökemedim — bugünkü sesli mesaj hakkını kullandın. Yarın sıfırlanıyor."
++    unavailable_rate_limit: "⚠️ Bunu yazıya dökemedim — şu anda çok fazla sesli mesaj var. Bir dakika sonra tekrar dene."
++    unavailable_auth: "⚠️ Bunu yazıya dökemedim — bu hesap için ses doğru yapılandırılmamış."
++    unavailable_reply_quota: "⚠️ Metinle yanıtlayacağım — ses servisinin kredisi bitti."
++    unavailable_reply_rate_limit: "⚠️ Metinle yanıtlayacağım — şu anda çok fazla sesli yanıt var."
++    unavailable_reply_auth: "⚠️ Metinle yanıtlayacağım — bu hesap için sesli yanıtlar doğru yapılandırılmamış."
++    status_stt_ok: "Yazıya dökme: kullanılabilir"
++    status_stt_off: "Yazıya dökme: kapalı (stt.enabled false)"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "Bu platformda ses kanalları desteklenmiyor."
+     channel_guild_only: "Bu komut yalnızca bir Discord sunucusunda çalışır."
+diff --git a/locales/uk.yaml b/locales/uk.yaml
+index f79eaaaf93..d9cf4007be 100644
+--- a/locales/uk.yaml
++++ b/locales/uk.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS (голосова відповідь на всі повідомлення)"
+     help: "{toggle}\n\n**Як працює /voice**\n• `/voice on` — голосова відповідь, коли ви надсилаєте голосове повідомлення\n• `/voice tts` — голосова відповідь на *кожне* повідомлення\n• `/voice off` — повернутися до відповідей лише текстом\n• `/voice status` — показати поточний режим\n• `/voice` (без аргументу) — швидке перемикання між увімк і вимк{channels}"
+     help_channels: "\n\n**Живі голосові канали (Discord)**\n• Спершу зайдіть у голосовий канал, потім `/voice channel` — я підключуся, слухатиму й відповідатиму голосом\n• `/voice leave` — від'єднатися від голосового каналу"
++    unavailable_quota: "⚠️ Не вдалося розшифрувати — ви використали голосові повідомлення на сьогодні. Ліміт оновиться завтра."
++    unavailable_rate_limit: "⚠️ Не вдалося розшифрувати — зараз забагато голосових повідомлень. Спробуйте за хвилину."
++    unavailable_auth: "⚠️ Не вдалося розшифрувати — голос налаштовано для цього облікового запису некоректно."
++    unavailable_reply_quota: "⚠️ Відповім текстом — на голосовому сервісі закінчилися кошти."
++    unavailable_reply_rate_limit: "⚠️ Відповім текстом — зараз забагато голосових відповідей."
++    unavailable_reply_auth: "⚠️ Відповім текстом — голосові відповіді налаштовано для цього облікового запису некоректно."
++    status_stt_ok: "Розшифрування: доступне"
++    status_stt_off: "Розшифрування: вимкнено (stt.enabled — false)"
+     transcript_echo_short: "🎙️ «{text}»"
+     channel_unsupported: "Голосові канали не підтримуються на цій платформі."
+     channel_guild_only: "Ця команда працює лише на сервері Discord."
+diff --git a/locales/zh-hant.yaml b/locales/zh-hant.yaml
+index 7ee2ec5d5c..ac32e9e0a0 100644
+--- a/locales/zh-hant.yaml
++++ b/locales/zh-hant.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS（對所有訊息進行語音回覆）"
+     help: "{toggle}\n\n**/voice 用法**\n• `/voice on` — 當你傳送語音訊息時以語音回覆\n• `/voice tts` — 對*每則*訊息都以語音回覆\n• `/voice off` — 恢復為純文字回覆\n• `/voice status` — 顯示目前模式\n• `/voice`（無參數）— 在開啟和關閉之間快速切換{channels}"
+     help_channels: "\n\n**即時語音頻道 (Discord)**\n• 先加入一個語音頻道，然後 `/voice channel` — 我會加入、聆聽並以語音回覆\n• `/voice leave` — 中斷語音頻道"
++    unavailable_quota: "⚠️ 無法轉寫 — 你今天的語音訊息額度已用完，明天重設。"
++    unavailable_rate_limit: "⚠️ 無法轉寫 — 目前語音訊息過多，請一分鐘後再試。"
++    unavailable_auth: "⚠️ 無法轉寫 — 此帳號的語音功能設定不正確。"
++    unavailable_reply_quota: "⚠️ 我會以文字回覆 — 語音服務額度已用盡。"
++    unavailable_reply_rate_limit: "⚠️ 我會以文字回覆 — 目前語音回覆過多。"
++    unavailable_reply_auth: "⚠️ 我會以文字回覆 — 此帳號的語音回覆設定不正確。"
++    status_stt_ok: "轉寫：可用"
++    status_stt_off: "轉寫：已關閉（stt.enabled 為 false）"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "此平台不支援語音頻道。"
+     channel_guild_only: "此指令僅能在 Discord 伺服器中使用。"
+diff --git a/locales/zh.yaml b/locales/zh.yaml
+index 4cd199efc4..e8ca1cd401 100644
+--- a/locales/zh.yaml
++++ b/locales/zh.yaml
+@@ -584,6 +584,14 @@ gateway:
+     label_all: "TTS（对所有消息进行语音回复）"
+     help: "{toggle}\n\n**/voice 用法**\n• `/voice on` — 当你发送语音消息时用语音回复\n• `/voice tts` — 对*每条*消息都用语音回复\n• `/voice off` — 恢复为纯文本回复\n• `/voice status` — 显示当前模式\n• `/voice`（无参数）— 在开启和关闭之间快速切换{channels}"
+     help_channels: "\n\n**实时语音频道 (Discord)**\n• 先加入一个语音频道，然后 `/voice channel` — 我会加入、聆听并用语音回复\n• `/voice leave` — 断开语音频道"
++    unavailable_quota: "⚠️ 无法转写 — 你今天的语音消息额度已用完，明天重置。"
++    unavailable_rate_limit: "⚠️ 无法转写 — 当前语音消息过多，请一分钟后再试。"
++    unavailable_auth: "⚠️ 无法转写 — 此账号的语音功能配置不正确。"
++    unavailable_reply_quota: "⚠️ 我将以文字回复 — 语音服务额度已用尽。"
++    unavailable_reply_rate_limit: "⚠️ 我将以文字回复 — 当前语音回复过多。"
++    unavailable_reply_auth: "⚠️ 我将以文字回复 — 此账号的语音回复配置不正确。"
++    status_stt_ok: "转写：可用"
++    status_stt_off: "转写：已关闭（stt.enabled 为 false）"
+     transcript_echo_short: "🎙️ \"{text}\""
+     channel_unsupported: "此平台不支持语音频道。"
+     channel_guild_only: "此命令只能在 Discord 服务器中使用。"
+diff --git a/tests/gateway/test_api_run_terminal.py b/tests/gateway/test_api_run_terminal.py
+new file mode 100644
+index 0000000000..bdec04c5c3
+--- /dev/null
++++ b/tests/gateway/test_api_run_terminal.py
+@@ -0,0 +1,252 @@
++"""Terminal output on the /v1/runs stream (LuminaVault addition).
++
++See ``gateway/platforms/api_run_terminal.py``. The behaviours pinned here are
++the ones a consumer that persists every run event depends on: output is
++routed to the run that spawned it and nowhere else, it is coalesced rather
++than one event per line, a runaway process cannot stream without bound, and
++nothing leaves unredacted.
++"""
++
++import json
++import threading
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++from aiohttp.test_utils import TestClient, TestServer
++
++from gateway.platforms import api_run_terminal as rt
++from tests.gateway.test_api_server_runs import _create_runs_app, _make_adapter
++
++SECRET = "sk-" + "a" * 40
++
++
++class ManualTimer:
++    """Stands in for threading.Timer so a test fires the flush itself."""
++
++    instances: list = []
++
++    def __init__(self, interval, callback):
++        self.interval = interval
++        self.callback = callback
++        self.cancelled = False
++        self.daemon = False
++        ManualTimer.instances.append(self)
++
++    def start(self):
++        pass
++
++    def cancel(self):
++        self.cancelled = True
++
++    def fire(self):
++        if not self.cancelled:
++            self.callback()
++
++
++class Clock:
++    def __init__(self):
++        self.now = 0.0
++
++    def __call__(self):
++        return self.now
++
++
++def _proc(pid="proc_1", run="run_a"):
++    return SimpleNamespace(id=pid, session_key=run)
++
++
++@pytest.fixture
++def router():
++    ManualTimer.instances = []
++    clock = Clock()
++    r = rt.RunTerminalRouter(clock=clock, timer_factory=ManualTimer)
++    r.clock = clock
++    return r
++
++
++# --- tool.started / tool.completed fields ---------------------------------
++
++
++class TestFields:
++    def test_started_carries_the_command(self):
++        assert rt.started_fields("terminal", {"command": "ls -la", "background": True}) == {
++            "command": "ls -la",
++            "background": True,
++        }
++
++    def test_other_tools_add_nothing(self):
++        assert rt.started_fields("read_file", {"path": "x"}) == {}
++        assert rt.completed_fields("read_file", '{"output": "x"}') == {}
++
++    def test_completed_reads_the_terminal_json(self):
++        fields = rt.completed_fields("terminal", json.dumps({"output": "a\nb", "exit_code": 2}))
++        assert fields == {"output": "a\nb", "output_truncated": False, "exit_code": 2}
++
++    def test_a_plain_text_result_is_output_with_no_exit_code(self):
++        fields = rt.completed_fields("terminal", "blocked by policy")
++        assert fields["output"] == "blocked by policy"
++        assert "exit_code" not in fields
++
++    def test_a_boolean_is_not_an_exit_code(self):
++        fields = rt.completed_fields("terminal", json.dumps({"output": "", "exit_code": True}))
++        assert "exit_code" not in fields
++
++    def test_long_output_keeps_the_tail(self):
++        text = "x" * rt.MAX_OUTPUT_CHARS + "THE ERROR"
++        fields = rt.completed_fields("terminal", json.dumps({"output": text, "exit_code": 1}))
++        assert fields["output_truncated"] is True
++        assert fields["output"].endswith("THE ERROR")
++        assert len(fields["output"]) == rt.MAX_OUTPUT_CHARS
++
++    def test_secrets_are_redacted_in_command_and_output(self):
++        started = rt.started_fields("terminal", {"command": f"export OPENAI_API_KEY={SECRET}"})
++        completed = rt.completed_fields("terminal", json.dumps({"output": f"key={SECRET}", "exit_code": 0}))
++        assert SECRET not in started["command"]
++        assert SECRET not in completed["output"]
++
++
++# --- background output routing -----------------------------------------------
++
++
++class TestRouter:
++    def test_output_reaches_only_its_own_run(self, router):
++        a, b = [], []
++        router.register("run_a", a.append)
++        router.register("run_b", b.append)
++        router.on_output(_proc(run="run_a"), "x" * rt.FLUSH_CHARS)
++
++        assert [e["chunk"] for e in a] == ["x" * rt.FLUSH_CHARS]
++        assert b == []
++
++    def test_output_from_an_unknown_run_is_dropped(self, router):
++        seen = []
++        router.register("run_a", seen.append)
++        router.on_output(_proc(run="someone_else"), "hello")
++        router.unregister("run_a")
++        assert seen == []
++
++    def test_small_chunks_are_coalesced_until_the_timer(self, router):
++        seen = []
++        router.register("run_a", seen.append)
++        for line in ["one\n", "two\n", "three\n"]:
++            router.on_output(_proc(), line)
++        assert seen == []
++        assert len(ManualTimer.instances) == 1
++
++        ManualTimer.instances[0].fire()
++        assert [e["chunk"] for e in seen] == ["one\ntwo\nthree\n"]
++        assert seen[0]["event"] == "terminal.output"
++        assert seen[0]["process_id"] == "proc_1"
++
++    def test_a_chunk_after_the_interval_flushes_at_once(self, router):
++        seen = []
++        router.register("run_a", seen.append)
++        router.on_output(_proc(), "first\n")
++        router.clock.now += rt.FLUSH_INTERVAL
++        router.on_output(_proc(), "second\n")
++        assert [e["chunk"] for e in seen] == ["first\nsecond\n"]
++
++    def test_processes_keep_separate_buffers(self, router):
++        seen = []
++        router.register("run_a", seen.append)
++        router.on_output(_proc("p1"), "from one")
++        router.on_output(_proc("p2"), "from two")
++        router.unregister("run_a")
++        assert {(e["process_id"], e["chunk"]) for e in seen} == {("p1", "from one"), ("p2", "from two")}
++
++    def test_unregister_flushes_what_is_buffered(self, router):
++        seen = []
++        router.register("run_a", seen.append)
++        router.on_output(_proc(), "tail")
++        router.unregister("run_a")
++        assert [e["chunk"] for e in seen] == ["tail"]
++        router.on_output(_proc(), "after the run")
++        assert len(seen) == 1
++
++    def test_a_runaway_process_stops_at_the_budget_with_one_marker(self, router, monkeypatch):
++        monkeypatch.setattr(rt, "MAX_STREAM_CHARS", 10_000)
++        seen = []
++        router.register("run_a", seen.append)
++        for _ in range(20):
++            router.on_output(_proc(), "y" * rt.FLUSH_CHARS)
++
++        streamed = sum(len(e["chunk"]) for e in seen)
++        markers = [e for e in seen if e.get("truncated")]
++        assert streamed == 10_000
++        assert len(markers) == 1
++
++    def test_chunks_are_redacted(self, router):
++        seen = []
++        router.register("run_a", seen.append)
++        router.on_output(_proc(), f"token={SECRET}\n" + "z" * rt.FLUSH_CHARS)
++        assert seen and SECRET not in seen[0]["chunk"]
++
++    def test_install_chains_an_existing_sink_and_is_idempotent(self, router):
++        calls = []
++        registry = SimpleNamespace(on_output=lambda session, chunk: calls.append(chunk))
++        router.install(registry)
++        router.install(registry)
++        registry.on_output(_proc(), "hi")
++        assert calls == ["hi"]
++
++    def test_a_failing_consumer_never_breaks_the_reader_thread(self, router):
++        def explode(_event):
++            raise RuntimeError("consumer went away")
++
++        router.register("run_a", explode)
++        router.on_output(_proc(), "q" * rt.FLUSH_CHARS)  # must not raise
++
++
++# --- end to end through /v1/runs --------------------------------------------
++
++
++class TestRunStream:
++    @pytest.mark.asyncio
++    async def test_the_run_stream_carries_command_output_and_background_chunks(self):
++        adapter = _make_adapter()
++        app = _create_runs_app(adapter)
++        from tools.approval import get_current_session_key
++
++        seen_key = {}
++
++        def run_conversation(user_message=None, conversation_history=None, task_id=None):
++            cb = create.call_args.kwargs["tool_progress_callback"]
++            cb("tool.started", "terminal", "ls", {"command": "ls"})
++            cb(
++                "tool.completed", "terminal", None, None,
++                duration=0.2, is_error=False,
++                result=json.dumps({"output": "a.txt\nb.txt", "exit_code": 0}),
++            )
++            # A background process the run started writes output. Its
++            # session_key is the run's bound session key.
++            seen_key["key"] = get_current_session_key(default="")
++            proc = SimpleNamespace(id="proc_9", session_key=seen_key["key"])
++            adapter._run_terminal_router.on_output(proc, "server listening\n")
++            return {"final_response": "done"}
++
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_create_agent") as create:
++                agent = MagicMock()
++                agent.run_conversation.side_effect = run_conversation
++                agent.session_prompt_tokens = 0
++                agent.session_completion_tokens = 0
++                agent.session_total_tokens = 0
++                create.return_value = agent
++
++                resp = await cli.post("/v1/runs", json={"input": "list files"})
++                run_id = (await resp.json())["run_id"]
++                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
++
++        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
++        by_type = {e["event"]: e for e in events}
++
++        assert seen_key["key"] == run_id
++        assert by_type["tool.started"]["command"] == "ls"
++        assert by_type["tool.completed"]["output"] == "a.txt\nb.txt"
++        assert by_type["tool.completed"]["exit_code"] == 0
++        terminal = [e for e in events if e["event"] == "terminal.output"]
++        assert [(e["process_id"], e["chunk"]) for e in terminal] == [("proc_9", "server listening\n")]
++        assert all(e["run_id"] == run_id for e in terminal)
++        # The run's own events still end the stream the way they always did.
++        assert events[-1]["event"] == "run.completed"
+diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
+index 64f601650c..9fc1ef0a89 100644
 --- a/tests/gateway/test_api_server.py
 +++ b/tests/gateway/test_api_server.py
-@@ -625,6 +625,7 @@
-     app.router.add_get("/v1/health", adapter._handle_health)
+@@ -403,6 +403,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
      app.router.add_get("/v1/models", adapter._handle_models)
+     app.router.add_get("/api/model/options", adapter._handle_model_options)
      app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
 +    app.router.add_post("/v1/ingestions", adapter._handle_ingestion)
      app.router.add_get("/v1/skills", adapter._handle_skills)
      app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
-     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
-@@ -946,6 +947,11 @@
-             assert data["features"]["chat_completions"] is True
-             assert data["features"]["run_status"] is True
-             assert data["features"]["run_events_sse"] is True
-+            assert data["features"]["multimodal_ingestion"] is True
-+            assert data["features"]["ingestion_remote_source_url"] is True
-+            assert "application/pdf" in data["features"]["ingestion_supported_mime_types"]
-+            assert data["features"]["ingestion_max_source_bytes"] >= 1
-+            assert data["endpoints"]["ingestion"] == {"method": "POST", "path": "/v1/ingestions"}
-             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
-             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
-             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
-@@ -966,6 +972,49 @@
-             data = await authed.json()
-             assert data["auth"]["required"] is True
+     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+@@ -746,6 +747,49 @@ class TestDisconnectedAgentReap:
+         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
+         agent.interrupt.assert_called_once()
  
 +    @pytest.mark.asyncio
 +    async def test_ingestion_runs_agent_and_returns_structured_analysis(self, adapter):
@@ -163,5 +1631,1246 @@
 +            adapter._run_agent.assert_not_awaited()
 +
  
- # ---------------------------------------------------------------------------
- # /v1/skills and /v1/toolsets endpoints
+ class TestRunEventCallback:
+ 
+@@ -953,6 +997,12 @@ class TestCapabilitiesEndpoint:
+             assert data["features"]["chat_completions"] is True
+             assert data["features"]["run_status"] is True
+             assert data["features"]["run_events_sse"] is True
++            # LuminaVault: the multimodal ingestion API.
++            assert data["features"]["multimodal_ingestion"] is True
++            assert data["features"]["ingestion_remote_source_url"] is True
++            assert "application/pdf" in data["features"]["ingestion_supported_mime_types"]
++            assert data["features"]["ingestion_max_source_bytes"] >= 1
++            assert data["endpoints"]["ingestion"] == {"method": "POST", "path": "/v1/ingestions"}
+             assert data["features"]["runs_idempotency"]["supported"] is True
+             assert data["features"]["runs_idempotency"]["durable"] is True
+             assert data["features"]["model_options"] is True
+diff --git a/tests/gateway/test_api_server_profiles.py b/tests/gateway/test_api_server_profiles.py
+new file mode 100644
+index 0000000000..2688c1e561
+--- /dev/null
++++ b/tests/gateway/test_api_server_profiles.py
+@@ -0,0 +1,127 @@
++"""Cross-profile read-only routes on the API server.
++
++``/api/instance``, ``/api/profiles/sessions`` and
++``/api/profiles/{profile}/sessions/{id}/messages`` let a remote dashboard
++list every profile's sessions on this machine through one API key.
++"""
++
++from pathlib import Path
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++from hermes_cli import profile_sessions
++from hermes_state import SessionDB
++
++
++def _make_app(api_key: str = "sk-secret") -> web.Application:
++    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": api_key}))
++    app = web.Application()
++    app.router.add_get("/api/instance", adapter._handle_instance)
++    app.router.add_get("/api/profiles/sessions", adapter._handle_profiles_sessions)
++    app.router.add_get(
++        "/api/profiles/{profile}/sessions/{session_id}/messages",
++        adapter._handle_profile_session_messages,
++    )
++    return app
++
++
++AUTH = {"Authorization": "Bearer sk-secret"}
++
++
++def _seed(home: Path, sessions):
++    home.mkdir(parents=True, exist_ok=True)
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        for session_id, source, messages in sessions:
++            db.create_session(session_id, source)
++            for role, content in messages:
++                db.append_message(session_id, role, content)
++    finally:
++        db.close()
++
++
++@pytest.fixture
++def two_profiles(tmp_path, monkeypatch):
++    homes = {"default": tmp_path / "default", "mac-mcp": tmp_path / "mac-mcp"}
++    _seed(homes["default"], [("cron_1", "cron", [("assistant", "daily brief")])])
++    _seed(homes["mac-mcp"], [("tg_1", "telegram", [("user", "hi"), ("assistant", "hello")])])
++
++    def targets(profile=None):
++        if profile and profile != "all":
++            if profile not in homes:
++                raise profile_sessions.UnknownProfileError(f"Profile '{profile}' does not exist.")
++            return [(profile, homes[profile])]
++        return list(homes.items())
++
++    monkeypatch.setattr(profile_sessions, "profile_targets", targets)
++    return homes
++
++
++@pytest.mark.asyncio
++async def test_routes_require_the_api_key(two_profiles):
++    async with TestClient(TestServer(_make_app())) as cli:
++        for path in ("/api/instance", "/api/profiles/sessions", "/api/profiles/default/sessions/cron_1/messages"):
++            resp = await cli.get(path)
++            assert resp.status == 401, path
++
++
++@pytest.mark.asyncio
++async def test_instance_lists_every_profile(two_profiles):
++    async with TestClient(TestServer(_make_app())) as cli:
++        resp = await cli.get("/api/instance", headers=AUTH)
++        assert resp.status == 200
++        body = await resp.json()
++        assert body["object"] == "hermes.instance"
++        assert body["profiles"] == ["default", "mac-mcp"]
++        assert body["version"]
++
++
++@pytest.mark.asyncio
++async def test_sessions_from_all_profiles_are_tagged(two_profiles):
++    async with TestClient(TestServer(_make_app())) as cli:
++        resp = await cli.get("/api/profiles/sessions", headers=AUTH)
++        assert resp.status == 200
++        body = await resp.json()
++        by_id = {row["id"]: row for row in body["data"]}
++        assert set(by_id) == {"cron_1", "tg_1"}
++        assert by_id["tg_1"]["profile"] == "mac-mcp"
++        assert by_id["tg_1"]["source"] == "telegram"
++        assert by_id["cron_1"]["profile"] == "default"
++        assert all(isinstance(row["is_active"], bool) for row in body["data"])
++        # Client-safe projection: no system prompt leaks through.
++        assert all("system_prompt" not in row for row in body["data"])
++        assert body["errors"] == []
++
++
++@pytest.mark.asyncio
++async def test_sessions_filter_by_profile_and_source(two_profiles):
++    async with TestClient(TestServer(_make_app())) as cli:
++        resp = await cli.get("/api/profiles/sessions?profile=mac-mcp", headers=AUTH)
++        assert [row["id"] for row in (await resp.json())["data"]] == ["tg_1"]
++
++        resp = await cli.get("/api/profiles/sessions?source=cron", headers=AUTH)
++        assert [row["id"] for row in (await resp.json())["data"]] == ["cron_1"]
++
++        resp = await cli.get("/api/profiles/sessions?profile=nope", headers=AUTH)
++        assert resp.status == 404
++
++
++@pytest.mark.asyncio
++async def test_messages_come_from_the_named_profile(two_profiles):
++    async with TestClient(TestServer(_make_app())) as cli:
++        resp = await cli.get("/api/profiles/mac-mcp/sessions/tg_1/messages", headers=AUTH)
++        assert resp.status == 200
++        body = await resp.json()
++        assert body["profile"] == "mac-mcp"
++        assert [(m["role"], m["content"]) for m in body["data"]] == [("user", "hi"), ("assistant", "hello")]
++
++        # The session exists, but in another profile.
++        resp = await cli.get("/api/profiles/default/sessions/tg_1/messages", headers=AUTH)
++        assert resp.status == 404
++
++        resp = await cli.get("/api/profiles/nope/sessions/tg_1/messages", headers=AUTH)
++        assert resp.status == 404
+diff --git a/tests/gateway/test_telegram_audio_vs_voice.py b/tests/gateway/test_telegram_audio_vs_voice.py
+index 5549735f27..243a77921d 100644
+--- a/tests/gateway/test_telegram_audio_vs_voice.py
++++ b/tests/gateway/test_telegram_audio_vs_voice.py
+@@ -73,7 +73,9 @@ async def test_voice_message_still_transcribed():
+             history=[],
+         )
+ 
+-    mock_transcribe.assert_called_once_with("/tmp/voice.ogg", None, "gateway")
++    # LuminaVault: the platform rides along so the audio proxy can meter Telegram voice
++    # separately from every other source that shares the OpenAI wire shape.
++    mock_transcribe.assert_called_once_with("/tmp/voice.ogg", None, "gateway", channel="telegram")
+     # The transcript passes through as a plain quoted line — no "voice message"
+     # meta-commentary in the LLM-visible prompt.
+     assert "hello world" in result
+diff --git a/tests/gateway/test_voice_quota_surfacing.py b/tests/gateway/test_voice_quota_surfacing.py
+new file mode 100644
+index 0000000000..ff14e5379e
+--- /dev/null
++++ b/tests/gateway/test_voice_quota_surfacing.py
+@@ -0,0 +1,345 @@
++"""Tell the user when transcription failed for a reason they can act on.
++
++Two rules are in tension here, and both matter:
++
++  1. The *prompt* must stay neutral. A previous version leaked "no STT provider
++     configured" into the conversation, which persisted in history and made the
++     model volunteer setup advice for every later turn. All the LLM may see is
++     ``[voice message could not be transcribed]``.
++
++  2. The *user* must still learn why their voice notes stopped working, when
++     the cause is quota, rate limiting or misconfiguration. The model cannot
++     tell them — it does not know.
++
++So the reason travels out of band, is localized, is limited to actionable
++causes, and is debounced per chat.
++"""
++
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++from gateway.config import GatewayConfig
++
++
++def _runner():
++    """A GatewayRunner with only the collaborators these paths touch."""
++    from gateway.run import GatewayRunner
++
++    runner = GatewayRunner.__new__(GatewayRunner)
++    runner.config = GatewayConfig(stt_enabled=True)
++    runner._voice_notice_sent_at = {}
++    runner._adapter_for_source = MagicMock()
++    runner._thread_metadata_for_source = MagicMock(return_value=None)
++    runner._reply_anchor_for_event = MagicMock(return_value=None)
++    return runner
++
++
++def _source(chat_id="chat-1", platform="telegram"):
++    source = MagicMock()
++    source.chat_id = chat_id
++    source.platform = platform
++    return source
++
++
++def _failure(kind):
++    return {"success": False, "transcript": "", "error": "nope", "error_kind": kind}
++
++
++class TestErrorKindPropagation:
++    @pytest.mark.asyncio
++    async def test_error_kind_reaches_the_sink(self):
++        runner = _runner()
++        sink = []
++
++        with patch("tools.transcription_tools.transcribe_audio", return_value=_failure("quota")):
++            text, transcripts = await runner._enrich_message_with_transcription(
++                "", ["/tmp/a.ogg"], error_sink=sink,
++            )
++
++        assert sink == ["quota"]
++        assert transcripts == []
++
++    @pytest.mark.asyncio
++    async def test_prompt_stays_neutral_regardless_of_cause(self):
++        """The whole point of the sink: the reason must not reach the model."""
++        runner = _runner()
++        sink = []
++
++        with patch("tools.transcription_tools.transcribe_audio", return_value=_failure("quota")):
++            text, _ = await runner._enrich_message_with_transcription(
++                "", ["/tmp/a.ogg"], error_sink=sink,
++            )
++
++        assert text.startswith("[voice message could not be transcribed")
++        for leaked in ("quota", "allowance", "402", "rate", "billing"):
++            assert leaked not in text.lower()
++
++    @pytest.mark.asyncio
++    async def test_sink_is_optional(self):
++        """Existing callers pass no sink and must be unaffected."""
++        runner = _runner()
++
++        with patch("tools.transcription_tools.transcribe_audio", return_value=_failure("quota")):
++            text, transcripts = await runner._enrich_message_with_transcription("", ["/tmp/a.ogg"])
++
++        assert text.startswith("[voice message could not be transcribed")
++        assert transcripts == []
++
++    @pytest.mark.asyncio
++    async def test_success_leaves_the_sink_empty(self):
++        runner = _runner()
++        sink = []
++        ok = {"success": True, "transcript": "hello there", "provider": "openai"}
++
++        with patch("tools.transcription_tools.transcribe_audio", return_value=ok):
++            text, transcripts = await runner._enrich_message_with_transcription(
++                "", ["/tmp/a.ogg"], error_sink=sink,
++            )
++
++        assert sink == []
++        assert transcripts == ["hello there"]
++        assert text == '"hello there"'
++
++
++class TestUserNotice:
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("kind", ["quota", "rate_limit", "auth"])
++    async def test_actionable_causes_notify_once(self, kind):
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(MagicMock(), _source(), [kind])
++
++        adapter.send.assert_awaited_once()
++        sent_text = adapter.send.await_args.args[1]
++        assert sent_text.strip()
++        # Localized, not a raw key.
++        assert "gateway.voice" not in sent_text
++
++    @pytest.mark.asyncio
++    async def test_transient_upstream_failures_stay_quiet(self):
++        """A blip should degrade to the neutral marker, not narrate itself."""
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(MagicMock(), _source(), ["upstream"])
++
++        adapter.send.assert_not_awaited()
++
++    @pytest.mark.asyncio
++    async def test_no_failures_means_no_notice(self):
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(MagicMock(), _source(), [])
++
++        adapter.send.assert_not_awaited()
++
++    @pytest.mark.asyncio
++    async def test_repeat_failures_are_debounced_per_chat(self):
++        """Someone out of quota often sends several notes before reading the reply."""
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++        event, source = MagicMock(), _source()
++
++        for _ in range(4):
++            await runner._notify_voice_unavailable(event, source, ["quota"])
++
++        assert adapter.send.await_count == 1
++
++    @pytest.mark.asyncio
++    async def test_debounce_does_not_leak_between_chats(self):
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(MagicMock(), _source("chat-a"), ["quota"])
++        await runner._notify_voice_unavailable(MagicMock(), _source("chat-b"), ["quota"])
++
++        assert adapter.send.await_count == 2
++
++    @pytest.mark.asyncio
++    async def test_quota_outranks_other_causes(self):
++        """With mixed causes, report the one the user can actually act on."""
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(
++            MagicMock(), _source(), ["upstream", "auth", "quota"],
++        )
++
++        from agent.i18n import t
++        assert adapter.send.await_args.args[1] == t("gateway.voice.unavailable_quota")
++
++    @pytest.mark.asyncio
++    async def test_send_failure_is_swallowed(self):
++        """A failed notice must not take down the message that triggered it."""
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock(side_effect=RuntimeError("telegram is down"))
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(MagicMock(), _source(), ["quota"])
++
++    @pytest.mark.asyncio
++    async def test_missing_adapter_is_not_an_error(self):
++        runner = _runner()
++        runner._adapter_for_source.return_value = None
++
++        await runner._notify_voice_unavailable(MagicMock(), _source(), ["quota"])
++
++    @pytest.mark.asyncio
++    async def test_failed_send_is_not_debounced(self):
++        """If the notice never landed, the next failure should try again."""
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock(side_effect=RuntimeError("down"))
++        runner._adapter_for_source.return_value = adapter
++        event, source = MagicMock(), _source()
++
++        await runner._notify_voice_unavailable(event, source, ["quota"])
++        adapter.send = AsyncMock()
++        await runner._notify_voice_unavailable(event, source, ["quota"])
++
++        adapter.send.assert_awaited_once()
++
++
++class TestStatusClassification:
++    @pytest.mark.parametrize("status,expected", [
++        (402, "quota"),
++        (429, "rate_limit"),
++        (401, "auth"),
++        (403, "auth"),
++        (500, "upstream"),
++        (503, "upstream"),
++        (None, "upstream"),
++    ])
++    def test_http_status_maps_to_error_kind(self, status, expected):
++        from tools.transcription_tools import classify_stt_status
++
++        assert classify_stt_status(status) == expected
++
++    def test_only_actionable_kinds_are_user_facing(self):
++        from tools.transcription_tools import (
++            STT_ERROR_KIND_UPSTREAM,
++            STT_USER_FACING_ERROR_KINDS,
++        )
++
++        assert STT_ERROR_KIND_UPSTREAM not in STT_USER_FACING_ERROR_KINDS
++        assert STT_USER_FACING_ERROR_KINDS == {"quota", "rate_limit", "auth"}
++
++
++class TestSpokenReplyFallback:
++    """Voice replies degrade to text when their provider runs dry.
++
++    The text reply is never at risk: `_send_voice_reply` runs *before* it, so a
++    TTS failure costs the audio and nothing else. What was missing is the
++    explanation — spoken replies would simply stop happening.
++
++    Inbound and outbound are debounced separately. They fail for different
++    reasons, and a user who has been told transcription is down should still
++    learn that voice replies are too.
++    """
++
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("kind", ["quota", "rate_limit", "auth"])
++    async def test_actionable_tts_failures_explain_themselves(self, kind):
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(
++            MagicMock(), _source(), [kind], direction="tts",
++        )
++
++        adapter.send.assert_awaited_once()
++        from agent.i18n import t
++        assert adapter.send.await_args.args[1] == t(f"gateway.voice.unavailable_reply_{kind}")
++
++    @pytest.mark.asyncio
++    async def test_transient_tts_failures_stay_quiet(self):
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++
++        await runner._notify_voice_unavailable(
++            MagicMock(), _source(), ["upstream"], direction="tts",
++        )
++
++        adapter.send.assert_not_awaited()
++
++    @pytest.mark.asyncio
++    async def test_inbound_and_outbound_debounce_independently(self):
++        runner = _runner()
++        adapter = MagicMock()
++        adapter.send = AsyncMock()
++        runner._adapter_for_source.return_value = adapter
++        event, source = MagicMock(), _source()
++
++        await runner._notify_voice_unavailable(event, source, ["quota"], direction="stt")
++        await runner._notify_voice_unavailable(event, source, ["quota"], direction="tts")
++        # Repeats of each are still suppressed.
++        await runner._notify_voice_unavailable(event, source, ["quota"], direction="stt")
++        await runner._notify_voice_unavailable(event, source, ["quota"], direction="tts")
++
++        assert adapter.send.await_count == 2
++
++    @pytest.mark.asyncio
++    async def test_the_two_directions_say_different_things(self):
++        """A reply failure must not claim the user's own voice note failed."""
++        from agent.i18n import t
++
++        assert t("gateway.voice.unavailable_quota") != t("gateway.voice.unavailable_reply_quota")
++
++
++class TestProviderExceptionClassification:
++    """TTS providers disagree about how to report an HTTP failure."""
++
++    def test_openai_style_status_attribute(self):
++        from tools.tool_backend_helpers import classify_audio_exception
++
++        class Err(Exception):
++            status_code = 429
++
++        assert classify_audio_exception(Err()) == "rate_limit"
++
++    def test_requests_style_response_attribute(self):
++        from tools.tool_backend_helpers import classify_audio_exception
++
++        class Err(Exception):
++            response = MagicMock(status_code=402)
++
++        assert classify_audio_exception(Err()) == "quota"
++
++    def test_gemini_embeds_the_status_in_the_message_only(self):
++        """Gemini's TTS path raises a bare RuntimeError; the text is all there is."""
++        from tools.tool_backend_helpers import classify_audio_exception
++
++        exc = RuntimeError("Gemini TTS API error (HTTP 429): RESOURCE_EXHAUSTED")
++        assert classify_audio_exception(exc) == "rate_limit"
++
++    def test_unrecognised_failures_are_treated_as_transient(self):
++        from tools.tool_backend_helpers import classify_audio_exception
++
++        assert classify_audio_exception(RuntimeError("socket closed")) == "upstream"
++
++    def test_stt_taxonomy_is_the_same_taxonomy(self):
++        """One set, so the gateway's user-facing check means the same thing."""
++        from tools.tool_backend_helpers import AUDIO_USER_FACING_ERROR_KINDS
++        from tools.transcription_tools import STT_USER_FACING_ERROR_KINDS
++
++        assert STT_USER_FACING_ERROR_KINDS is AUDIO_USER_FACING_ERROR_KINDS
+diff --git a/tests/hermes_cli/test_default_fallback_chain.py b/tests/hermes_cli/test_default_fallback_chain.py
+new file mode 100644
+index 0000000000..4a5979e5d9
+--- /dev/null
++++ b/tests/hermes_cli/test_default_fallback_chain.py
+@@ -0,0 +1,32 @@
++"""The shipped default fallback chain.
++
++LuminaVault provisions one Hermes per tenant, each with a fresh PVC seeded from
++``DEFAULT_CONFIG``. An empty ``fallback_providers`` meant a tenant whose primary
++provider lost auth had nowhere to go and the turn simply failed. The default now
++carries a zero-cost OpenRouter chain so a fresh tenant always has somewhere to
++land.
++"""
++
++from hermes_cli.config import DEFAULT_CONFIG
++from hermes_cli.fallback_config import get_fallback_chain
++
++
++def test_default_config_ships_a_non_empty_fallback_chain():
++    assert DEFAULT_CONFIG["fallback_providers"], "a fresh tenant must inherit a fallback chain"
++
++
++def test_default_chain_parses_into_ordered_provider_model_entries():
++    chain = get_fallback_chain(DEFAULT_CONFIG)
++    assert [(e["provider"], e["model"]) for e in chain] == [
++        ("openrouter", "z-ai/glm-5.2:free"),
++        ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
++        ("openrouter", "deepseek/deepseek-v4-flash"),
++    ]
++
++
++def test_default_chain_leads_with_zero_cost_slugs():
++    """The two ``:free`` slugs come before the billable one, so a fallback only
++    starts costing money after both zero-cost hops are exhausted."""
++    chain = get_fallback_chain(DEFAULT_CONFIG)
++    free = [e["model"].endswith(":free") for e in chain]
++    assert free == sorted(free, reverse=True), f"billable entry ordered before a free one: {chain}"
+diff --git a/tests/hermes_cli/test_fallback_cmd.py b/tests/hermes_cli/test_fallback_cmd.py
+index 0b1499d78e..ee1a90e8f8 100644
+--- a/tests/hermes_cli/test_fallback_cmd.py
++++ b/tests/hermes_cli/test_fallback_cmd.py
+@@ -20,6 +20,9 @@ def isolated_home(tmp_path, monkeypatch):
+     return tmp_path
+ 
+ def _write_config(home: Path, data: dict) -> None:
++    # LuminaVault ships a non-empty default chain (test_default_fallback_chain.py); these tests are
++    # about the commands, so they start from an empty chain unless they set one.
++    data = {"fallback_providers": [], **data}
+     config_path = home / ".hermes" / "config.yaml"
+     config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+ 
+@@ -318,7 +321,7 @@ class TestClearCommand:
+ class TestDispatcher:
+ 
+     def test_unknown_subcommand_exits(self, isolated_home):
+-        _write_config(isolated_home, {})
++        _write_config(isolated_home, {"fallback_providers": []})
+         from hermes_cli.fallback_cmd import cmd_fallback
+         with pytest.raises(SystemExit):
+             cmd_fallback(types.SimpleNamespace(fallback_command="nope"))
+diff --git a/tests/tools/test_stt_base_url_resolution.py b/tests/tools/test_stt_base_url_resolution.py
+new file mode 100644
+index 0000000000..37094f6973
+--- /dev/null
++++ b/tests/tools/test_stt_base_url_resolution.py
+@@ -0,0 +1,82 @@
++"""Regression tests for ``stt.openai.base_url`` on the env-key path.
++
++``_resolve_openai_audio_client_config`` has two ways to find an OpenAI-shaped
++STT credential: ``stt.openai.api_key`` in config.yaml, or the
++``VOICE_TOOLS_OPENAI_KEY`` / ``OPENAI_API_KEY`` environment variables. Only the
++first used to honour a configured ``base_url``; the env path hard-coded
++``OPENAI_BASE_URL``.
++
++That asymmetry is a live footgun for any deployment that keeps the endpoint in
++config.yaml and the secret in the environment (the shape managed LuminaVault
++tenants use): the credential for a private audio proxy was sent to
++``api.openai.com``, which answers 401, and the user saw only
++"voice message could not be transcribed".
++
++``tools/tts_tool.py`` never had the bug — these tests pin the STT side to match.
++"""
++
++from unittest.mock import patch
++
++import pytest
++
++
++from tools.transcription_common import OPENAI_BASE_URL
++
++PROXY = "https://api.example.test/v1"
++
++
++@pytest.fixture(autouse=True)
++def isolate_env(monkeypatch):
++    """Drop the direct-key env vars so each test states its own credential."""
++    for key in ("VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"):
++        monkeypatch.delenv(key, raising=False)
++
++
++def _resolve(stt_config, direct_key=""):
++    # The resolver lives in tools.transcription_cloud since upstream 0.23 and imports both
++    # collaborators at call time, so they are patched where they are defined.
++    from tools import tool_backend_helpers, transcription_tools as tt
++
++    with patch.object(tt, "_load_stt_config", return_value=stt_config), \
++         patch.object(tool_backend_helpers, "resolve_openai_audio_api_key", return_value=direct_key):
++        return tt._resolve_openai_audio_client_config()
++
++
++class TestBaseURLResolution:
++    def test_env_key_honours_configured_base_url(self):
++        """The regression. Key from the environment, endpoint from config.yaml."""
++        api_key, base_url = _resolve(
++            {"openai": {"base_url": PROXY}},
++            direct_key="env-secret",
++        )
++        assert api_key == "env-secret"
++        assert base_url == PROXY
++
++    def test_config_key_honours_configured_base_url(self):
++        """The path that always worked — pinned so it cannot regress."""
++        api_key, base_url = _resolve(
++            {"openai": {"api_key": "cfg-secret", "base_url": PROXY}},
++        )
++        assert api_key == "cfg-secret"
++        assert base_url == PROXY
++
++    def test_env_key_without_configured_base_url_falls_back_to_openai(self):
++        """No base_url configured must still reach OpenAI proper."""
++        api_key, base_url = _resolve({"openai": {}}, direct_key="env-secret")
++        assert api_key == "env-secret"
++        assert base_url == OPENAI_BASE_URL
++
++    def test_empty_stt_config_falls_back_to_openai(self):
++        """No ``stt`` section at all is the default install."""
++        api_key, base_url = _resolve({}, direct_key="env-secret")
++        assert api_key == "env-secret"
++        assert base_url == OPENAI_BASE_URL
++
++    def test_config_key_wins_over_env_key(self):
++        """Explicit config beats ambient environment, and keeps its base_url."""
++        api_key, base_url = _resolve(
++            {"openai": {"api_key": "cfg-secret", "base_url": PROXY}},
++            direct_key="env-secret",
++        )
++        assert api_key == "cfg-secret"
++        assert base_url == PROXY
+diff --git a/tests/tools/test_stt_channel_attribution.py b/tests/tools/test_stt_channel_attribution.py
+new file mode 100644
+index 0000000000..fa97ab2451
+--- /dev/null
++++ b/tests/tools/test_stt_channel_attribution.py
+@@ -0,0 +1,201 @@
++"""Tell the managed audio gateway which channel a voice note came from.
++
++The server meters every transcription, but over the OpenAI wire shape it can
++only see the tenant — a Telegram voice note and an iOS mic recording arrive
++identical. Without attribution, "how much does Telegram voice cost us" is not
++a question the usage rows can answer.
++
++So the channel travels as request headers on the OpenAI client. Headers rather
++than a form field because the server must stay OpenAI-shaped for every other
++client, and an unknown *form* field would have to be either rejected or
++silently ignored — neither is a good default for a metering signal.
++
++The headers are advisory: a missing or unknown channel is recorded as
++``unknown`` server-side, never an error. Transcription must never fail because
++attribution failed.
++"""
++
++import struct
++import sys
++import types
++import wave
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++if "faster_whisper" not in sys.modules:
++    from importlib.machinery import ModuleSpec
++
++    faster_whisper_stub = types.ModuleType("faster_whisper")
++    faster_whisper_stub.WhisperModel = MagicMock(name="WhisperModel")
++    faster_whisper_stub.__spec__ = ModuleSpec("faster_whisper", loader=None)
++    sys.modules["faster_whisper"] = faster_whisper_stub
++
++
++pytestmark = pytest.mark.usefixtures("disable_lazy_stt_install")
++
++
++@pytest.fixture
++def sample_wav(tmp_path):
++    """A minimal valid WAV file (1 second of silence at 16kHz)."""
++    wav_path = tmp_path / "test.wav"
++    n_frames = 16000
++    silence = struct.pack(f"<{n_frames}h", *([0] * n_frames))
++
++    with wave.open(str(wav_path), "wb") as wf:
++        wf.setnchannels(1)
++        wf.setsampwidth(2)
++        wf.setframerate(16000)
++        wf.writeframes(silence)
++
++    return str(wav_path)
++
++
++@pytest.fixture(autouse=True)
++def clean_env(monkeypatch):
++    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
++    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
++    monkeypatch.delenv("GROQ_API_KEY", raising=False)
++
++
++def _openai_client():
++    client = MagicMock()
++    client.audio.transcriptions.create.return_value = "hello"
++    return client
++
++
++class TestTranscribeOpenAIHeaders:
++    def test_channel_travels_as_a_request_header(self, monkeypatch, sample_wav):
++        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
++
++        with patch("tools.transcription_tools._HAS_OPENAI", True), \
++             patch("openai.OpenAI", return_value=_openai_client()) as openai_cls:
++            from tools.transcription_tools import _transcribe_openai
++            _transcribe_openai(sample_wav, "whisper-1", channel="telegram")
++
++        headers = openai_cls.call_args.kwargs["default_headers"]
++        assert headers["X-Lumina-Channel"] == "telegram"
++        assert headers["X-Lumina-Surface"] == "voice_note"
++
++    def test_no_channel_sends_no_channel_header(self, monkeypatch, sample_wav):
++        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
++
++        with patch("tools.transcription_tools._HAS_OPENAI", True), \
++             patch("openai.OpenAI", return_value=_openai_client()) as openai_cls:
++            from tools.transcription_tools import _transcribe_openai
++            _transcribe_openai(sample_wav, "whisper-1")
++
++        headers = openai_cls.call_args.kwargs.get("default_headers") or {}
++        assert "X-Lumina-Channel" not in headers
++
++    def test_channel_is_normalised_to_a_bare_token(self, monkeypatch, sample_wav):
++        """Header values must survive the wire: no newlines, no exotic casing.
++
++        A platform name reaches here from plugin platforms too, where it is
++        whatever string the plugin chose. An httpx client raises on a header
++        value containing a newline, which would turn a metering nicety into a
++        failed transcription.
++        """
++        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
++
++        with patch("tools.transcription_tools._HAS_OPENAI", True), \
++             patch("openai.OpenAI", return_value=_openai_client()) as openai_cls:
++            from tools.transcription_tools import _transcribe_openai
++            _transcribe_openai(sample_wav, "whisper-1", channel="Telegram\nX-Evil: 1")
++
++        headers = openai_cls.call_args.kwargs["default_headers"]
++        assert headers["X-Lumina-Channel"] == "telegram"
++
++
++class TestTranscribeAudioForwardsChannel:
++    def test_transcribe_audio_passes_channel_through(self, monkeypatch, sample_wav):
++        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
++
++        with patch(
++            "tools.transcription_tools._load_stt_config",
++            return_value={"provider": "openai"},
++        ), patch(
++            "tools.transcription_tools._get_provider", return_value="openai"
++        ), patch(
++            "tools.transcription_tools._transcribe_openai",
++            return_value={"success": True, "transcript": "hi", "provider": "openai"},
++        ) as transcribe_openai:
++            from tools.transcription_tools import transcribe_audio
++            transcribe_audio(sample_wav, model="whisper-1", channel="telegram")
++
++        assert transcribe_openai.call_args.kwargs["channel"] == "telegram"
++
++
++class TestEveryTranscriptionPathIsAttributed:
++    def test_no_call_site_omits_the_channel(self):
++        """Every gateway transcription entry point must name its platform.
++
++        Since upstream 0.23 they live in ``gateway/run_inbound.py`` (the main
++        inbound path) and ``gateway/run_inbound_transcription.py`` (the pending /
++        interrupt path, which re-runs after a merge). A new one added later
++        without ``channel=`` would silently book its traffic as ``unknown``,
++        which looks like working code and reads as a drop in Telegram usage.
++        Assert the invariant at the source, across every gateway module.
++        """
++        import ast
++        from pathlib import Path
++
++        import gateway
++
++        call_sites = []
++        for path in sorted(Path(gateway.__file__).parent.glob("*.py")):
++            tree = ast.parse(path.read_text())
++            call_sites += [
++                (path.name, node)
++                for node in ast.walk(tree)
++                if isinstance(node, ast.Call)
++                and isinstance(node.func, ast.Attribute)
++                and node.func.attr == "_enrich_message_with_transcription"
++            ]
++
++        assert len(call_sites) == 3, "call-site count changed — update this test"
++        unattributed = [
++            f"{name}:{node.lineno}"
++            for name, node in call_sites
++            if not any(kw.arg == "channel" for kw in node.keywords)
++        ]
++        assert unattributed == [], (
++            f"transcription call sites without channel= at {unattributed}"
++        )
++
++
++class TestGatewayAttributesTheChannel:
++    @pytest.mark.asyncio
++    async def test_enrichment_forwards_the_platform_as_the_channel(self):
++        from gateway.config import GatewayConfig
++        from gateway.run import GatewayRunner
++
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner.config = GatewayConfig(stt_enabled=True)
++        runner._voice_notice_sent_at = {}
++
++        transcribe = MagicMock(return_value={"success": True, "transcript": "hi"})
++        with patch("tools.transcription_tools.transcribe_audio", transcribe):
++            await runner._enrich_message_with_transcription(
++                "", ["/tmp/a.ogg"], channel="telegram",
++            )
++
++        assert transcribe.call_args.kwargs["channel"] == "telegram"
++
++    @pytest.mark.asyncio
++    async def test_enrichment_without_a_channel_still_transcribes(self):
++        """Every existing call site omits the channel. None of them may break."""
++        from gateway.config import GatewayConfig
++        from gateway.run import GatewayRunner
++
++        runner = GatewayRunner.__new__(GatewayRunner)
++        runner.config = GatewayConfig(stt_enabled=True)
++        runner._voice_notice_sent_at = {}
++
++        transcribe = MagicMock(return_value={"success": True, "transcript": "hi"})
++        with patch("tools.transcription_tools.transcribe_audio", transcribe):
++            text, transcripts = await runner._enrich_message_with_transcription(
++                "", ["/tmp/a.ogg"],
++            )
++
++        assert transcripts == ["hi"]
+diff --git a/tools/tool_backend_helpers.py b/tools/tool_backend_helpers.py
+index 968b129d1a..cddcedc4b7 100644
+--- a/tools/tool_backend_helpers.py
++++ b/tools/tool_backend_helpers.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import logging
+ import os
++import re
+ from pathlib import Path
+ from typing import Any, Dict, Optional
+ 
+@@ -303,3 +304,65 @@ def fal_key_is_configured() -> bool:
+     """True when FAL_KEY is set (scope/env, else ``.env`` for CLI paths that run before dotenv
+     loads) to a non-whitespace value, so tool-side and CLI setup-time checks agree."""
+     return bool(_scoped_credential("FAL_KEY") or _dotenv_value("FAL_KEY"))
++
++
++# ---------------------------------------------------------------------------
++# Audio provider failure classification (shared by STT and TTS)
++# ---------------------------------------------------------------------------
++
++#: Failure classes worth telling the user about, rather than only logging.
++#: A transient upstream blip should stay quiet; being out of credits should
++#: not, because the user can act on it and will otherwise just watch voice
++#: quietly stop working.
++AUDIO_ERROR_KIND_QUOTA = "quota"
++AUDIO_ERROR_KIND_RATE_LIMIT = "rate_limit"
++AUDIO_ERROR_KIND_AUTH = "auth"
++AUDIO_ERROR_KIND_UPSTREAM = "upstream"
++
++AUDIO_USER_FACING_ERROR_KINDS = frozenset({
++    AUDIO_ERROR_KIND_QUOTA,
++    AUDIO_ERROR_KIND_RATE_LIMIT,
++    AUDIO_ERROR_KIND_AUTH,
++})
++
++
++def classify_audio_status(status_code) -> str:
++    """Map an HTTP status from an audio provider to an error kind."""
++    if status_code == 402:
++        return AUDIO_ERROR_KIND_QUOTA
++    if status_code == 429:
++        return AUDIO_ERROR_KIND_RATE_LIMIT
++    if status_code in (401, 403):
++        return AUDIO_ERROR_KIND_AUTH
++    return AUDIO_ERROR_KIND_UPSTREAM
++
++
++def classify_audio_exception(exc: BaseException) -> str:
++    """Classify a provider exception without knowing which SDK raised it.
++
++    Three shapes occur across the providers we call, and none of them share a
++    base class:
++
++    - ``openai.APIStatusError`` carries ``status_code`` directly.
++    - ``requests.HTTPError`` carries ``response.status_code``.
++    - Gemini's TTS path raises a bare ``RuntimeError`` whose message embeds
++      ``(HTTP 429)`` and nothing else — so the text is the only signal there.
++
++    Falls back to ``upstream`` when no status can be recovered, which keeps an
++    unrecognised failure quiet rather than guessing at a cause the user would
++    then act on.
++    """
++    status = getattr(exc, "status_code", None)
++    if status is None:
++        response = getattr(exc, "response", None)
++        status = getattr(response, "status_code", None)
++    if status is None:
++        match = re.search(r"HTTP (\d{3})", str(exc))
++        if match:
++            status = int(match.group(1))
++    if status is None:
++        return AUDIO_ERROR_KIND_UPSTREAM
++    try:
++        return classify_audio_status(int(status))
++    except (TypeError, ValueError):
++        return AUDIO_ERROR_KIND_UPSTREAM
+diff --git a/tools/transcription_cloud.py b/tools/transcription_cloud.py
+index b54514ae29..d283798f42 100644
+--- a/tools/transcription_cloud.py
++++ b/tools/transcription_cloud.py
+@@ -9,6 +9,7 @@ are read lazily from ``tools.transcription_tools``.
+ 
+ from __future__ import annotations
+ 
++import contextvars
+ import logging
+ import re
+ import tempfile
+@@ -38,7 +39,94 @@ def _has_xai_stt_credentials() -> bool:
+     return bool(resolve_xai_http_credentials().get("api_key"))
+ 
+ 
+-def _with_openai_client(api_key: str, base_url: Optional[str], file_path: str, log_label: str, body):
++from tools.tool_backend_helpers import (
++    AUDIO_ERROR_KIND_AUTH,
++    AUDIO_ERROR_KIND_QUOTA,
++    AUDIO_ERROR_KIND_RATE_LIMIT,
++    AUDIO_ERROR_KIND_UPSTREAM,
++    AUDIO_USER_FACING_ERROR_KINDS,
++    classify_audio_status,
++)
++
++# --- LuminaVault: STT failure classification and channel attribution -------
++# Failure classes worth telling the user about, as opposed to logging.
++# A transient upstream blip should stay silent; being out of quota should not,
++# because the user can act on it and will otherwise just see their voice notes
++# quietly stop working.
++# Aliases onto the shared taxonomy in ``tools.tool_backend_helpers``. TTS
++# classifies failures the same way, and the gateway decides whether to surface
++# one using a single set — two copies of this would drift the first time a
++# provider started returning a status the other side did not know about.
++STT_ERROR_KIND_QUOTA = AUDIO_ERROR_KIND_QUOTA
++STT_ERROR_KIND_RATE_LIMIT = AUDIO_ERROR_KIND_RATE_LIMIT
++STT_ERROR_KIND_AUTH = AUDIO_ERROR_KIND_AUTH
++STT_ERROR_KIND_UPSTREAM = AUDIO_ERROR_KIND_UPSTREAM
++
++#: Error kinds the gateway surfaces to the user rather than only logging.
++STT_USER_FACING_ERROR_KINDS = AUDIO_USER_FACING_ERROR_KINDS
++
++
++def classify_stt_status(status_code: Optional[int]) -> str:
++    """Map an HTTP status from an OpenAI-shaped STT endpoint to an error kind."""
++    return classify_audio_status(status_code)
++
++
++#: Header carrying the messaging platform a voice note arrived on, and the
++#: surface within it. The LuminaVault audio proxy meters every transcription,
++#: but over the OpenAI wire shape it can only see the tenant — a Telegram
++#: voice note and an iOS mic recording look identical. These let the usage
++#: rows answer "what does Telegram voice cost us".
++#:
++#: Advisory only: an unknown or missing channel is recorded as ``unknown``
++#: server-side. Transcription must never fail because attribution failed,
++#: which is also why the value is scrubbed rather than passed through — a
++#: plugin platform names itself, and an httpx client raises on a header value
++#: containing a newline.
++STT_CHANNEL_HEADER = "X-Lumina-Channel"
++STT_SURFACE_HEADER = "X-Lumina-Surface"
++STT_SURFACE_VOICE_NOTE = "voice_note"
++
++_CHANNEL_HEADER_MAX_LEN = 32
++
++
++def _normalize_channel(channel: Optional[str]) -> Optional[str]:
++    """Reduce a platform name to a bare lowercase token, or None.
++
++    Truncates at the first character outside ``[a-z0-9_-]`` rather than
++    filtering those characters out. ``"telegram\\nX-Evil: 1"`` must become
++    ``"telegram"``, not ``"telegramx-evil1"`` — a filter would splice
++    injected text onto a legitimate name and produce a plausible-looking
++    channel that no platform actually is.
++    """
++    if not channel:
++        return None
++    token = []
++    for ch in str(channel).strip().lower():
++        if ch.isascii() and (ch.isalnum() or ch in "_-"):
++            token.append(ch)
++            continue
++        break
++    return "".join(token[:_CHANNEL_HEADER_MAX_LEN]) or None
++
++
++def _audio_attribution_headers(channel: Optional[str]) -> Dict[str, str]:
++    """Request headers attributing a transcription to its origin channel."""
++    token = _normalize_channel(channel)
++    if token is None:
++        return {}
++    return {
++        STT_CHANNEL_HEADER: token,
++        STT_SURFACE_HEADER: STT_SURFACE_VOICE_NOTE,
++    }
++
++
++#: The channel of the transcription in progress, set by ``transcribe_audio``
++#: so upstream's dispatch layers need not thread it through.
++_STT_CHANNEL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("lumina_stt_channel", default=None)
++
++
++def _with_openai_client(api_key: str, base_url: Optional[str], file_path: str, log_label: str, body,
++                        default_headers: Optional[dict[str, str]] = None):
+     """Run ``body(client)`` on a fresh OpenAI SDK client; always closed. Transport shape comes from
+     ``stt.openai.timeout`` / ``stt.openai.max_retries`` (defaults 60s, 1 retry; #112939) for every
+     rider of this helper — openai, groq and deepinfra — because a self-hosted endpoint's model cold
+@@ -55,6 +143,8 @@ def _with_openai_client(api_key: str, base_url: Optional[str], file_path: str, l
+             base_url=base_url,
+             timeout=_config_number(openai_config, "timeout", DEFAULT_STT_TIMEOUT),
+             max_retries=_config_number(openai_config, "max_retries", 1, cast=int),
++            # LuminaVault: only when attributing, so the bare request stays byte-identical.
++            **({"default_headers": default_headers} if default_headers else {}),
+         )
+         try:
+             return body(client)
+@@ -72,6 +162,19 @@ def _with_openai_client(api_key: str, base_url: Optional[str], file_path: str, l
+         if isinstance(exc, STTResponseError):
+             # The provider's own message already reads as an error; no "Transcription failed:" prefix.
+             return _error_result(str(exc))
++        try:
++            from openai import APIStatusError
++        except ImportError:  # pragma: no cover
++            APIStatusError = ()
++        if isinstance(APIStatusError, type) and isinstance(exc, APIStatusError):
++            # LuminaVault. Must precede APIError, its parent. The SDK builds ``exc.message`` from the
++            # body's ``error.message``, so behind the LuminaVault audio proxy this is already the
++            # sentence written for the user: pass it through with a kind the gateway can act on.
++            kind = classify_stt_status(getattr(exc, "status_code", None))
++            message = getattr(exc, "message", None) or str(exc)
++            if kind != STT_ERROR_KIND_UPSTREAM:
++                logger.warning("%s transcription refused (%s): %s", log_label, kind, message)
++            return _error_result(message, error_kind=kind)
+         for cls, label in ((APIConnectionError, "Connection error"), (APITimeoutError, "Request timeout"),
+                            (APIError, "API error")):
+             if isinstance(exc, cls):
+@@ -127,7 +230,7 @@ def _transcribe_groq(
+ def _transcribe_openai(
+     file_path: str, model_name: str, *, api_key: Optional[str] = None,
+     base_url: Optional[str] = None, provider_label: str = "openai", language: Optional[str] = None,
+-    prompt: Optional[str] = None) -> dict[str, Any]:
++    prompt: Optional[str] = None, channel: Optional[str] = None) -> dict[str, Any]:
+     """Transcribe via the OpenAI ``audio.transcriptions.create`` SDK shape, shared by every
+     OpenAI-compatible endpoint (DeepInfra etc.): explicit ``api_key``/``base_url`` skip the
+     OpenAI-only auth chain; ``provider_label`` names the response's provider."""
+@@ -188,7 +291,9 @@ def _transcribe_openai(
+         logger.info("Transcribed %s via %s (%s, %d chars)",
+                     Path(file_path).name, provider_label, model_name, len(transcript_text))
+         return _ok_result(transcript_text, provider_label)
+-    return _with_openai_client(api_key, base_url, file_path, provider_label, _run)
++    # LuminaVault: only the OpenAI path may point at the LuminaVault audio proxy, so only it is attributed.
++    headers = _audio_attribution_headers(channel or _STT_CHANNEL.get()) if provider_label == "openai" else {}
++    return _with_openai_client(api_key, base_url, file_path, provider_label, _run, default_headers=headers)
+ 
+ 
+ def _transcribe_mistral(
+@@ -408,7 +513,10 @@ def _direct_openai_credentials(cfg_api_key: str, cfg_base_url: str) -> Optional[
+     if cfg_base_url and _is_local_or_private_url(cfg_base_url):
+         return "not-needed", cfg_base_url
+     direct_api_key = resolve_openai_audio_api_key()
+-    return (direct_api_key, OPENAI_BASE_URL) if direct_api_key else None
++    # LuminaVault: honour a configured ``stt.openai.base_url`` on the env-key path too. Without this a
++    # deployment with the key in the environment and the endpoint in config.yaml silently sends that
++    # key to api.openai.com.
++    return (direct_api_key, (cfg_base_url or OPENAI_BASE_URL)) if direct_api_key else None
+ 
+ 
+ def _resolve_openai_audio_client_config() -> tuple[str, str]:
+diff --git a/tools/transcription_tools.py b/tools/transcription_tools.py
+index 072eed5f03..3670fbec41 100644
+--- a/tools/transcription_tools.py
++++ b/tools/transcription_tools.py
+@@ -37,7 +37,10 @@ from tools.transcription_local import (
+     _normalize_local_stt_language, _transcribe_local_command, _try_lazy_install_stt,
+     build_local_transcribe_kwargs)
+ # The ``_transcribe_<provider>`` handlers are looked up in this module's globals by _dispatch_stt_provider.
+-from tools.transcription_cloud import (
++from tools.transcription_cloud import (  # noqa: F401 - LuminaVault STT names re-exported below
++    STT_CHANNEL_HEADER, STT_ERROR_KIND_AUTH, STT_ERROR_KIND_QUOTA, STT_ERROR_KIND_RATE_LIMIT,
++    STT_ERROR_KIND_UPSTREAM, STT_SURFACE_HEADER, STT_SURFACE_VOICE_NOTE, STT_USER_FACING_ERROR_KINDS,
++    _STT_CHANNEL, _audio_attribution_headers, _normalize_channel, classify_stt_status,
+     _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepinfra,
+     _transcribe_elevenlabs, _transcribe_groq, _transcribe_mistral, _transcribe_openai,
+     _transcribe_xai)
+@@ -528,6 +531,8 @@ def _route_stt_provider(
+         model_name = _builtin_model_name(provider, stt_config, model)
+         if provider in ("local", "local_command"):
+             model_name = _normalize_local_model(model_name)
++        if provider == "openai":  # LuminaVault: metering attribution, see transcribe_audio
++            return handler(file_path, model_name, language=language, prompt=prompt, channel=_STT_CHANNEL.get())
+         return handler(file_path, model_name, language=language, prompt=prompt)
+     # Command providers: after built-ins (``stt.providers.openai.command`` can't override the
+     # real handler) and BEFORE plugins, since config is more local than a plugin install.
+@@ -564,9 +569,22 @@ def _no_provider_error(provider: str, stt_config: dict[str, Any]) -> dict[str, A
+ 
+ 
+ def transcribe_audio(
+-    file_path: str, model: Optional[str] = None, source: Optional[str] = None) -> dict[str, Any]:
++    file_path: str, model: Optional[str] = None, source: Optional[str] = None,
++    channel: Optional[str] = None) -> dict[str, Any]:
+     """Validate, preprocess supported inputs, and dispatch transcription. ``source`` is a caller-surface
+-    label (``"gateway"``, ``"voice_mode"``) forwarded to the ``pre_transcription`` hook only."""
++    label (``"gateway"``, ``"voice_mode"``) forwarded to the ``pre_transcription`` hook only.
++
++    LuminaVault: ``channel`` is the messaging platform the audio arrived on ("telegram", ...), for
++    metering attribution. Only the OpenAI-shaped path carries it (as request headers), since that is
++    the one that may point at the LuminaVault audio proxy. Optional."""
++    token = _STT_CHANNEL.set(channel)
++    try:
++        return _transcribe_audio(file_path, model, source)
++    finally:
++        _STT_CHANNEL.reset(token)
++
++
++def _transcribe_audio(file_path: str, model: Optional[str], source: Optional[str]) -> dict[str, Any]:
+     # Secret-store refusal runs before ANY validation so the error names the real reason.
+     blocked = _read_block_error(file_path)
+     if blocked:
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index e224aeccab..2c203f7f06 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -38,7 +38,7 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
+ from tools.tts_command_provider import (
+     BUILTIN_TTS_PROVIDERS, _configured_command_tts_output_path, _generate_command_tts,
+     _get_command_tts_output_format, _is_command_tts_voice_compatible, _resolve_command_provider_config)
+-from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
++from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, classify_audio_exception
+ from tools.tts_tool_delivery import (
+     _resolve_max_text_length, _build_audio_delivery_files, _convert_to_opus, _remove_quietly,
+     _repair_ogg_container, _resolve_audio_delivery_profile, _split_text_for_tts)
+@@ -405,10 +405,16 @@ def _media_tag(paths: list[str], voice_compatible: bool) -> str:
+     return f"[[audio_as_voice]]\n{media_tag}" if voice_compatible else media_tag
+ 
+ 
+-def _tool_failure(prefix: str, provider: str, exc: BaseException) -> str:
+-    """Log and wrap a synthesis failure as the standard error envelope (traceback except for config errors)."""
++def _tool_failure(prefix: str, provider: str, exc: BaseException, *, classify: bool = False) -> str:
++    """Log and wrap a synthesis failure as the standard error envelope (traceback except for config errors).
++
++    LuminaVault: with *classify*, an unexpected provider error carries an ``error_kind``. Running out
++    of credits and being rate limited are things the user can act on, and the gateway decides whether
++    to say so out of band; anything unrecognised stays ``upstream``, a transient blip kept quiet."""
+     error_msg = f"{prefix} ({provider}): {exc}"
+     logger.error("%s", error_msg, exc_info=not isinstance(exc, ValueError))
++    if classify:
++        return tool_error(error_msg, success=False, error_kind=classify_audio_exception(exc))
+     return tool_error(error_msg, success=False)
+ 
+ 
+@@ -458,11 +464,17 @@ def _text_to_speech_single(
+     except FileNotFoundError as e:
+         return _tool_failure("TTS dependency missing", provider, e)
+     except Exception as e:
+-        return _tool_failure("TTS generation failed", provider, e)
++        return _tool_failure("TTS generation failed", provider, e, classify=True)
+ 
+ 
+ class _ChunkFailed(Exception):
+-    """One chunk's synthesis returned an error envelope; message is the final tool error text."""
++    """One chunk's synthesis returned an error envelope; message is the final tool error text.
++
++    LuminaVault: carries the chunk's ``error_kind`` so a long-form reply reports it too."""
++
++    def __init__(self, message: str, error_kind: Optional[str] = None):
++        super().__init__(message)
++        self.error_kind = error_kind
+ 
+ 
+ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: set, **single_kwargs) -> tuple:
+@@ -489,7 +501,7 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts:
+             raise RuntimeError(f"TTS chunk {index} returned invalid JSON: {str(raw_result)[:200]}")
+         if not chunk_result.get("success"):
+             error_msg = chunk_result.get("error", "unknown error")
+-            raise _ChunkFailed(f"TTS chunk {index} failed ({provider}): {error_msg}")
++            raise _ChunkFailed(f"TTS chunk {index} failed ({provider}): {error_msg}", chunk_result.get("error_kind"))
+         actual_path = str(chunk_result.get("file_path") or chunk_path)
+         if not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0:
+             raise RuntimeError(f"TTS chunk {index} produced no final audio: {actual_path}")
+@@ -562,11 +574,13 @@ def text_to_speech_tool(
+                 "target_file_bytes": delivery_profile.target_file_bytes},
+         }, ensure_ascii=False)
+     except _ChunkFailed as exc:
++        if exc.error_kind:
++            return tool_error(str(exc), success=False, error_kind=exc.error_kind)
+         return tool_error(str(exc), success=False)
+     except ValueError as exc:
+         return _tool_failure("TTS delivery error", provider, exc)
+     except Exception as exc:
+-        return _tool_failure("TTS long-form generation failed", provider, exc)
++        return _tool_failure("TTS long-form generation failed", provider, exc, classify=True)
+     finally:
+         final_absolute = {os.path.abspath(path) for path in final_paths}
+         for artifact in generated_artifacts:

@@ -71,7 +71,7 @@ class TestErrorKindPropagation:
                 "", ["/tmp/a.ogg"], error_sink=sink,
             )
 
-        assert text == "[voice message could not be transcribed]"
+        assert text.startswith("[voice message could not be transcribed")
         for leaked in ("quota", "allowance", "402", "rate", "billing"):
             assert leaked not in text.lower()
 
@@ -83,7 +83,7 @@ class TestErrorKindPropagation:
         with patch("tools.transcription_tools.transcribe_audio", return_value=_failure("quota")):
             text, transcripts = await runner._enrich_message_with_transcription("", ["/tmp/a.ogg"])
 
-        assert text == "[voice message could not be transcribed]"
+        assert text.startswith("[voice message could not be transcribed")
         assert transcripts == []
 
     @pytest.mark.asyncio

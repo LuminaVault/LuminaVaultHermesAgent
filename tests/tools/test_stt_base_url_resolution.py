@@ -20,6 +20,8 @@ from unittest.mock import patch
 import pytest
 
 
+from tools.transcription_common import OPENAI_BASE_URL
+
 PROXY = "https://api.example.test/v1"
 
 
@@ -31,10 +33,12 @@ def isolate_env(monkeypatch):
 
 
 def _resolve(stt_config, direct_key=""):
-    from tools import transcription_tools as tt
+    # The resolver lives in tools.transcription_cloud since upstream 0.23 and imports both
+    # collaborators at call time, so they are patched where they are defined.
+    from tools import tool_backend_helpers, transcription_tools as tt
 
     with patch.object(tt, "_load_stt_config", return_value=stt_config), \
-         patch.object(tt, "resolve_openai_audio_api_key", return_value=direct_key):
+         patch.object(tool_backend_helpers, "resolve_openai_audio_api_key", return_value=direct_key):
         return tt._resolve_openai_audio_client_config()
 
 
@@ -58,19 +62,15 @@ class TestBaseURLResolution:
 
     def test_env_key_without_configured_base_url_falls_back_to_openai(self):
         """No base_url configured must still reach OpenAI proper."""
-        from tools import transcription_tools as tt
-
         api_key, base_url = _resolve({"openai": {}}, direct_key="env-secret")
         assert api_key == "env-secret"
-        assert base_url == tt.OPENAI_BASE_URL
+        assert base_url == OPENAI_BASE_URL
 
     def test_empty_stt_config_falls_back_to_openai(self):
         """No ``stt`` section at all is the default install."""
-        from tools import transcription_tools as tt
-
         api_key, base_url = _resolve({}, direct_key="env-secret")
         assert api_key == "env-secret"
-        assert base_url == tt.OPENAI_BASE_URL
+        assert base_url == OPENAI_BASE_URL
 
     def test_config_key_wins_over_env_key(self):
         """Explicit config beats ambient environment, and keeps its base_url."""

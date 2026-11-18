@@ -1,136 +1,142 @@
 # What LuminaVault changed in the vendored Hermes Agent import
 
 This repository is **not a git fork** of `NousResearch/hermes-agent`. It is a
-squashed vendored import: `0b99ab2` seeds the repo and `0f5b20a`
-("chore: import Hermes Agent with LuminaVault ingestion API") drops the whole
-upstream tree in as one commit — 6243 files, 2.26M lines. There is no upstream
-remote and no common ancestor, which is why CI carries a
-`Deny unrelated histories / check-common-ancestor` job.
+squashed vendored import: there is no upstream remote and no common ancestor
+with upstream, which is why CI carries a `check-common-ancestor` guard.
 
 The consequence is that **LuminaVault's own changes to upstream files are
-invisible in git history** — they are buried inside that one import commit.
-Anyone re-importing a newer upstream would silently delete them. This document
-is the manifest so that cannot happen.
+invisible in git history**. Anyone re-importing a newer upstream would silently
+delete them. This document is the manifest so that cannot happen, and
+[`luminavault-delta.patch`](./luminavault-delta.patch) is the whole delta
+against the current base as one diff.
 
-Established 2026-09-12 by diffing the import tree against upstream tarballs.
+## Base
 
-## Base commit
+| Import | Upstream | Date |
+|---|---|---|
+| `0f5b20a` (first import) | `e4ea0a0e` (≈ 0.18.2) | 2026-07-13 |
+| this re-import | **`v0.23.1`** (`3b421578`) | 2026-11-16 |
 
-The import is a clean snapshot of upstream **`e4ea0a0e`**
-(2026-07-13T06:44:16Z, "fix(config): preserve string-typed config values").
+Why the re-import: **CVE-2026-10221** (injection via `_compress_context`,
+remotely triggerable, public exploit) affects every version up to 0.19.0.
+Upstream's guard (`_transcript_has_real_user_turn`,
+`_validate_summary_user_provenance`) hooks into seams 0.18 does not have, so
+porting it by hand was not an option. The companion CVE-2026-10224
+(`gateway/platforms/feishu.py`) is fixed upstream too.
 
-Verified by extracting `0f5b20a` and diffing the full tree against that commit:
-only the entries below differ. Earlier candidates were ruled out —
-`2bd721ce` (08:49:35Z, 45s before the import) already contained a kanban trio
-the import lacks, so the import predates it.
+`luminavault-delta.patch` is `git diff v0.23.1 <this tree> -- . ':!docs/'`.
 
-## LuminaVault modifications — 2 files, 114 lines, purely additive
+## What LuminaVault carries
 
-Zero upstream lines are removed. The patch is saved alongside this file as
-[`luminavault-delta.patch`](./luminavault-delta.patch) (7 hunks).
+Upstream split several large modules between 0.18 and 0.23, so the features
+below live in different files than they did in the first import. Each is
+marked `LuminaVault` in a comment at the change.
 
-| File | Lines added |
-|---|---:|
-| `gateway/platforms/api_server.py` | 65 |
-| `tests/gateway/test_api_server.py` | 49 |
+### Multimodal ingestion API — load-bearing
 
-What it adds — the **multimodal ingestion API**, which upstream has never had
-(`_handle_ingestion`, `v1/ingestions` and `multimodal_ingestion` return zero
-hits across every upstream version, including main):
+`POST /v1/ingestions` analyses a remotely hosted source with the normal agent
+toolset and returns `{title, markdown, summary, tags, credibility}`. Upstream
+has never had it. The LuminaVault server's durable multimodal ingestion path
+calls it; losing it breaks that feature.
 
-- `_handle_ingestion` → `POST /v1/ingestions`, which analyses a remotely hosted
-  multimodal source with the normal agent toolset
-- capability advertisement: `multimodal_ingestion`, `ingestion_api`,
-  `ingestion_remote_source_url`, `ingestion_supported_mime_types`
-  (pdf, text/\*, image/\*, audio/\*, video/\*), `ingestion_max_source_bytes`
-  (2 GiB)
-- the endpoint entry `"ingestion": {"method": "POST", "path": "/v1/ingestions"}`
-- run-stream bookkeeping used by the same surface: `_run_stream_subscribers`,
-  `_stopping_run_ids`
+- `gateway/platforms/api_server.py`: `_handle_ingestion`, the route, the
+  capability flags (`multimodal_ingestion`, `ingestion_api`,
+  `ingestion_remote_source_url`, `ingestion_supported_mime_types`,
+  `ingestion_max_source_bytes`) and the `ingestion` endpoint entry.
+- Tests: `tests/gateway/test_api_server.py`.
 
-**This is load-bearing.** `LuminaVaultServer` has a multimodal ingestion
-subsystem wired to it — `ingestion.publicBaseUrl`, `ingestionCapabilitiesService`
-and a "Durable multimodal ingestion" path in `Sources/App/App+build.swift`.
-Losing it breaks that feature.
-
-## Terminal output on `/v1/runs` — added 2026-09-22
+### Terminal output on `/v1/runs`
 
 Upstream streams an agent's terminal only over the `tui_gateway` WebSocket,
-which the cluster deployment does not run (it runs `hermes gateway run`
-alone), and `/v1/runs` drops the terminal tool's command and result. So no
-LuminaVault client could see what the agent ran. This adds it to the run
-stream, additively:
-
-| File | Change |
-|---|---|
-| `gateway/platforms/api_run_terminal.py` | **new** — field builders and `RunTerminalRouter` |
-| `gateway/platforms/api_server.py` | ~25 lines: import, router install in `__init__`, extra fields in `_make_run_event_callback`, register/unregister around `run_conversation` |
-| `tests/gateway/test_api_run_terminal.py` | **new** — 18 cases, one end to end through `/v1/runs` |
-
-Wire additions, all optional fields or a new event name:
+which the cluster does not run, and `/v1/runs` drops the terminal tool's
+command and result. This adds them to the run stream:
 
 - `tool.started` for `terminal`: `command`, `background`
 - `tool.completed` for `terminal`: `output` (tail, 16k chars), `exit_code`,
   `output_truncated`
-- new `terminal.output`: `{process_id, chunk}` or `{process_id, chunk: "", truncated: true}`
+- new event `terminal.output`: `{process_id, chunk}` or
+  `{process_id, chunk: "", truncated: true}`
 
-Background output is routed by the process's `session_key`, which `/v1/runs`
-binds to the `run_id`; `task_id` is useless for this because the terminal tool
-collapses it to the shared container key. Output is coalesced (250 ms / 4k
-chars) and capped at 256k chars per run because consumers persist every event,
-and everything is passed through `redact_sensitive_text(force=True)`.
+Files: `gateway/platforms/api_run_terminal.py` (new: field builders,
+`RunTerminalRouter`, `router_for`), `gateway/platforms/api_server_runs.py`
+(event fields, router registered around the `/v1/runs` worker by the run's
+approval session key). Tests: `tests/gateway/test_api_run_terminal.py`.
 
-The diff is saved as [`luminavault-delta-run-terminal.patch`](./luminavault-delta-run-terminal.patch).
-A re-import must re-apply it alongside `luminavault-delta.patch`.
+### Cross-profile session views on the API server
 
-## Upstream content the import dropped — 6 paths
+`GET /api/instance`, `GET /api/profiles/sessions`,
+`GET /api/profiles/{profile}/sessions/{session_id}/messages`: read-only, for the
+LuminaVault Agents page. Upstream 0.23 has `/api/profiles/sessions` only on the
+dashboard web server, which the cluster does not run.
 
-All six were lost to `.gitignore` rules inherited from upstream, because the
-import staged files with `git add`:
+Files: `hermes_cli/profile_sessions.py` (new), handlers and routes in
+`gateway/platforms/api_server.py`. Tests: `tests/gateway/test_api_server_profiles.py`.
 
-| Path | Rule |
-|---|---|
-| `infographic/` | `.gitignore:152` — `infographic/` |
-| `optional-skills/creative/concept-diagrams/examples` | `.gitignore:39` — `examples/` |
-| `web/public/fonts` | `.gitignore:79` — `web/public/fonts/` |
-| `skills/creative/p5js/scripts/export-frames.js` | `.gitignore:25` — `export*` |
-| `skills/creative/p5js/references/export-pipeline.md` | `.gitignore:25` — `export*` |
-| `website/src/data` | `.gitignore:29` — `data/` (**fixed**, see below) |
+### Voice: STT/TTS failure notices, channel attribution, `base_url`
 
-Two of these are over-broad patterns catching real source rather than build
-output: `examples/` swallows a skill's documentation, and `export*` swallows a
-skill's script — so that p5js export skill is shipped broken.
+- **Failure classification** (`tools/tool_backend_helpers.py`:
+  `classify_audio_status`, `classify_audio_exception`, `AUDIO_ERROR_KIND_*`).
+  STT (`tools/transcription_cloud.py`, `_with_openai_client`) and TTS
+  (`tools/tts_tool.py`, `_tool_failure(..., classify=True)`, `_ChunkFailed`)
+  attach an `error_kind` to failures.
+- **User notices** (`gateway/run_inbound_transcription.py`:
+  `_notify_voice_unavailable`, wired in `gateway/run_inbound.py` and
+  `gateway/run_voice.py`): one localized message when voice failed for an
+  actionable reason (quota, rate limit, auth), debounced per chat and direction.
+  The LLM still sees only the neutral marker. Locale keys
+  `gateway.voice.unavailable_*`, `unavailable_reply_*`, `status_stt_*` in every
+  `locales/*.yaml` (English text in `ar`, which upstream added later).
+  `/voice status` reports whether transcription is enabled
+  (`gateway/slash_commands.py`).
+- **Channel attribution**: the OpenAI-shaped STT request carries
+  `X-Lumina-Channel` / `X-Lumina-Surface` so the LuminaVault audio proxy can
+  meter Telegram voice separately. `transcribe_audio(..., channel=)` sets a
+  ContextVar that the `openai` route passes to `_transcribe_openai`; every
+  gateway call to `_enrich_message_with_transcription` names the channel
+  (asserted by `tests/tools/test_stt_channel_attribution.py`).
+- **`stt.openai.base_url` on the env-key path** (`_direct_openai_credentials`):
+  upstream still sends an environment key to api.openai.com even when config
+  names another endpoint.
+- Tests: `tests/gateway/test_voice_quota_surfacing.py`,
+  `tests/tools/test_stt_channel_attribution.py`,
+  `tests/tools/test_stt_base_url_resolution.py`, and the expected call in
+  `tests/gateway/test_telegram_audio_vs_voice.py`.
 
-`data/` was narrowed to `/data/` in PR #10 after the missing
-`website/src/data/userStories.json` broke the docs build on every run. The other
-five are still dropped.
+### Default fallback provider chain
+
+`hermes_cli/config_defaults.py`: `fallback_providers` defaults to two zero-cost
+OpenRouter slugs, then a cheap billable one, so a fresh tenant whose primary
+provider loses auth still has somewhere to go. Tests:
+`tests/hermes_cli/test_default_fallback_chain.py`; `tests/hermes_cli/test_fallback_cmd.py`
+starts its configs from an empty chain.
+
+### Repository
+
+- `.github/workflows/luminavault-image.yml` publishes
+  `ghcr.io/luminavault/luminavault-hermes-agent:sha-*`.
+- `.gitignore`: `!website/src/data/`, which the first import lost to the bare
+  `data/` rule.
+
+Dropped at this re-import because upstream fixed or superseded them: the
+first import's CI repairs, its dependency pins (upstream's lockfiles are newer;
+re-run OSV), and the slash-worker cold-start test budget.
 
 ## If you re-import a newer upstream
 
-1. Import the new upstream tree, using `git add --force` for the six paths above
-   (or fix the over-broad rules first).
-2. Re-apply `luminavault-delta.patch`.
-3. Expect manual reconciliation: against upstream `main` as of 2026-09-12 the
-   patch does **not** apply cleanly. The conflicts are context drift in two dict
-   literals (the capability map and the endpoint map) where upstream added
-   neighbouring keys — not semantic conflicts. The added code itself is
-   self-contained.
-4. Re-apply the post-import commits, which *are* visible in `git log`.
-5. Re-run the OSV scan; upstream pins will differ from ours.
+Do a real three-way merge; the patch alone will not apply across a large jump.
 
-## Why you might want to
-
-Upstream is at `0.21.2`; this tree declares `0.18.2`. OSV flags that version for
-**CVE-2026-10221** — injection via `_compress_context`, remotely triggerable,
-public exploit — with range `introduced: 0 → last_affected: 0.19.0`. The
-vulnerable code is present here (`run_agent.py`, `agent/context_compressor.py`)
-and upstream's guard (`_transcript_has_real_user_turn`, with
-`_validate_summary_user_provenance`) is not. The companion CVE-2026-10224 does
-not apply — `gateway/platforms/feishu.py` does not exist in this tree.
-
-Porting that guard by hand is awkward: upstream restructured compression across
-0.19–0.21 and the fix hooks into seams this tree does not have
-(`_build_summary_prompt`, `_find_context_summaries`,
-`COMPRESSED_SUMMARY_HAS_USER_TURN_KEY`, `_ground_historical_task_snapshot`).
-Now that the local delta is known to be 114 additive lines, re-importing is the
-cheaper and more durable route.
+1. Clone upstream (blobless is enough) and check out the current base
+   (`v0.23.1`) on a branch.
+2. Replace that branch's tree with this repo's tree (`git archive origin/main`)
+   and commit it: that commit is "LuminaVault on its base".
+3. Check out the new upstream tag and `git merge` that branch. Only files both
+   sides touched conflict.
+4. Take upstream for CI, lockfiles and dependency bumps. For each feature file,
+   take upstream and re-apply this repo's diff by hand; upstream moves code
+   between modules often (0.19–0.23 split `api_server.py`, `gateway/run.py`
+   and `transcription_tools.py`).
+5. Watch rename detection: it moved this repo's `docs/` files into
+   `website/docs/` once.
+6. Compare test failures against pristine upstream on the same machine, not
+   against zero: many upstream tests assume Linux CI.
+7. Regenerate `luminavault-delta.patch`, update this file, re-run OSV.

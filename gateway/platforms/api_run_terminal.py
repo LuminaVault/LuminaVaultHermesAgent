@@ -32,9 +32,12 @@ only missed if it straddles a flush boundary.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 from agent.redact import redact_sensitive_text
 
@@ -248,3 +251,18 @@ class RunTerminalRouter:
             route.push({"event": "terminal.output", "timestamp": time.time(), **fields})
         except Exception:
             pass
+
+
+def router_for(adapter: Any) -> "RunTerminalRouter":
+    """The adapter's router, created and hooked into ``process_registry`` on first use."""
+    router = getattr(adapter, "_run_terminal_router", None)
+    if router is None:
+        router = RunTerminalRouter()
+        try:
+            from tools.process_registry import process_registry
+            router.install(process_registry)
+        except Exception:
+            logger.debug("run terminal router not installed", exc_info=True)
+        adapter._run_terminal_router = router
+    return router
+

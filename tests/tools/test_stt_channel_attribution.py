@@ -130,35 +130,37 @@ class TestEveryTranscriptionPathIsAttributed:
     def test_no_call_site_omits_the_channel(self):
         """Every gateway transcription entry point must name its platform.
 
-        There are four of them — the main inbound path plus three batching /
-        voice-interrupt paths — and they are far apart in a very large file.
-        A fifth added later without ``channel=`` would silently book its
-        traffic as ``unknown``, which looks like working code and reads as a
-        drop in Telegram usage. Assert the invariant at the source, since
-        exercising all four paths end-to-end costs more than it proves.
+        Since upstream 0.23 they live in ``gateway/run_inbound.py`` (the main
+        inbound path) and ``gateway/run_inbound_transcription.py`` (the pending /
+        interrupt path, which re-runs after a merge). A new one added later
+        without ``channel=`` would silently book its traffic as ``unknown``,
+        which looks like working code and reads as a drop in Telegram usage.
+        Assert the invariant at the source, across every gateway module.
         """
         import ast
         from pathlib import Path
 
-        import gateway.run
+        import gateway
 
-        tree = ast.parse(Path(gateway.run.__file__).read_text())
-        call_sites = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_enrich_message_with_transcription"
-        ]
+        call_sites = []
+        for path in sorted(Path(gateway.__file__).parent.glob("*.py")):
+            tree = ast.parse(path.read_text())
+            call_sites += [
+                (path.name, node)
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_enrich_message_with_transcription"
+            ]
 
-        assert len(call_sites) == 4, "call-site count changed — update this test"
+        assert len(call_sites) == 3, "call-site count changed — update this test"
         unattributed = [
-            node.lineno
-            for node in call_sites
+            f"{name}:{node.lineno}"
+            for name, node in call_sites
             if not any(kw.arg == "channel" for kw in node.keywords)
         ]
         assert unattributed == [], (
-            f"transcription call sites without channel= at lines {unattributed}"
+            f"transcription call sites without channel= at {unattributed}"
         )
 
 
