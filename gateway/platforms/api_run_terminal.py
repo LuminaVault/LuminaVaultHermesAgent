@@ -55,14 +55,14 @@ MAX_STREAM_CHARS = 256_000
 FLUSH_INTERVAL = 0.25
 FLUSH_CHARS = 4_096
 
-Push = Callable[[Dict[str, Any]], None]
+Push = Callable[[dict[str, Any]], None]
 
 
 def _redact(text: str) -> str:
     return redact_sensitive_text(text, force=True)
 
 
-def started_fields(tool_name: Optional[str], args: Any) -> Dict[str, Any]:
+def started_fields(tool_name: Optional[str], args: Any) -> dict[str, Any]:
     """Extra ``tool.started`` fields for a terminal call, else ``{}``."""
     if tool_name not in TERMINAL_TOOLS or not isinstance(args, dict):
         return {}
@@ -72,7 +72,7 @@ def started_fields(tool_name: Optional[str], args: Any) -> Dict[str, Any]:
     return {"command": _redact(command), "background": bool(args.get("background"))}
 
 
-def completed_fields(tool_name: Optional[str], result: Any) -> Dict[str, Any]:
+def completed_fields(tool_name: Optional[str], result: Any) -> dict[str, Any]:
     """Extra ``tool.completed`` fields for a terminal call, else ``{}``.
 
     The terminal tool returns a JSON string with ``output`` and ``exit_code``.
@@ -96,7 +96,7 @@ def completed_fields(tool_name: Optional[str], result: Any) -> Dict[str, Any]:
     truncated = len(text) > MAX_OUTPUT_CHARS
     if truncated:
         text = text[-MAX_OUTPUT_CHARS:]
-    fields: Dict[str, Any] = {"output": _redact(text), "output_truncated": truncated}
+    fields: dict[str, Any] = {"output": _redact(text), "output_truncated": truncated}
     if exit_code is not None:
         fields["exit_code"] = exit_code
     return fields
@@ -108,8 +108,8 @@ class _Route:
     def __init__(self, push: Push, clock: Callable[[], float]):
         self.push = push
         self.clock = clock
-        self.buffers: Dict[str, str] = {}
-        self.first_buffered_at: Dict[str, float] = {}
+        self.buffers: dict[str, str] = {}
+        self.first_buffered_at: dict[str, float] = {}
         self.streamed = 0
         self.exhausted = False
         self.timer: Optional[threading.Timer] = None
@@ -131,7 +131,7 @@ class RunTerminalRouter:
         clock: Callable[[], float] = time.monotonic,
         timer_factory: Callable[[float, Callable[[], None]], Any] = threading.Timer,
     ):
-        self._routes: Dict[str, _Route] = {}
+        self._routes: dict[str, _Route] = {}
         self._lock = threading.Lock()
         self._clock = clock
         self._timer_factory = timer_factory
@@ -246,14 +246,14 @@ class RunTerminalRouter:
             route.timer = None
 
     @staticmethod
-    def _safe_push(route: _Route, fields: Dict[str, Any]) -> None:
+    def _safe_push(route: _Route, fields: dict[str, Any]) -> None:
         try:
             route.push({"event": "terminal.output", "timestamp": time.time(), **fields})
         except Exception:
             pass
 
 
-def router_for(adapter: Any) -> "RunTerminalRouter":
+def router_for(adapter: Any) -> RunTerminalRouter:
     """The adapter's router, created and hooked into ``process_registry`` on first use."""
     router = getattr(adapter, "_run_terminal_router", None)
     if router is None:

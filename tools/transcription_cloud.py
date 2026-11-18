@@ -109,7 +109,7 @@ def _normalize_channel(channel: Optional[str]) -> Optional[str]:
     return "".join(token[:_CHANNEL_HEADER_MAX_LEN]) or None
 
 
-def _audio_attribution_headers(channel: Optional[str]) -> Dict[str, str]:
+def _audio_attribution_headers(channel: Optional[str]) -> dict[str, str]:
     """Request headers attributing a transcription to its origin channel."""
     token = _normalize_channel(channel)
     if token is None:

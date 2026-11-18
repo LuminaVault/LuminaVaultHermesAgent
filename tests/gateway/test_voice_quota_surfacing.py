@@ -53,7 +53,7 @@ class TestErrorKindPropagation:
         sink = []
 
         with patch("tools.transcription_tools.transcribe_audio", return_value=_failure("quota")):
-            text, transcripts = await runner._enrich_message_with_transcription(
+            _text, transcripts = await runner._enrich_message_with_transcription(
                 "", ["/tmp/a.ogg"], error_sink=sink,
             )
 

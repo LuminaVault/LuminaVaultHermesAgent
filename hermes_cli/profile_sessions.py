@@ -23,7 +23,7 @@ class UnknownProfileError(LookupError):
     """The requested profile name is invalid or does not exist."""
 
 
-def profile_targets(profile: Optional[str] = None) -> List[Tuple[str, Path]]:
+def profile_targets(profile: Optional[str] = None) -> list[tuple[str, Path]]:
     """``(name, home)`` for one named profile, or for every profile."""
     from hermes_cli import profiles as profiles_mod
 
@@ -44,7 +44,7 @@ def profile_targets(profile: Optional[str] = None) -> List[Tuple[str, Path]]:
     return targets or [("default", Path(profiles_mod.get_profile_dir("default")))]
 
 
-def profile_names() -> List[str]:
+def profile_names() -> list[str]:
     return [name for name, _ in profile_targets()]
 
 
@@ -57,7 +57,7 @@ def _open_read_only(home: Path):
     return SessionDB(db_path=db_path, read_only=True)
 
 
-def is_active(session: Dict[str, Any], now: Optional[float] = None) -> bool:
+def is_active(session: dict[str, Any], now: Optional[float] = None) -> bool:
     now = time.time() if now is None else now
     last = session.get("last_active") or session.get("started_at") or 0
     return session.get("ended_at") is None and (now - last) < ACTIVE_WINDOW_SECONDS
@@ -69,8 +69,8 @@ def list_sessions(
     offset: int = 0,
     source: Optional[str] = None,
     profile: Optional[str] = None,
-    project: Callable[[Dict[str, Any]], Dict[str, Any]] = dict,
-) -> Dict[str, Any]:
+    project: Callable[[dict[str, Any]], dict[str, Any]] = dict,
+) -> dict[str, Any]:
     """Sessions from every profile (or one), newest activity first.
 
     Each row is ``project(row)`` tagged with ``profile`` and ``is_active``.
@@ -79,8 +79,8 @@ def list_sessions(
     """
     # Over-fetch per profile so the merged window is right for this page.
     per_profile = min(limit + offset, 500)
-    merged: List[Dict[str, Any]] = []
-    errors: List[Dict[str, str]] = []
+    merged: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
     now = time.time()
     for name, home in profile_targets(profile):
         try:
@@ -117,7 +117,7 @@ def list_sessions(
     }
 
 
-def session_messages(profile: str, session_id: str) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+def session_messages(profile: str, session_id: str) -> Optional[tuple[str, list[dict[str, Any]]]]:
     """``(resolved_session_id, messages)`` for a session in ``profile``.
 
     ``None`` when that profile has no such session.

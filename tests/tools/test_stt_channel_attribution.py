@@ -194,7 +194,7 @@ class TestGatewayAttributesTheChannel:
 
         transcribe = MagicMock(return_value={"success": True, "transcript": "hi"})
         with patch("tools.transcription_tools.transcribe_audio", transcribe):
-            text, transcripts = await runner._enrich_message_with_transcription(
+            _text, transcripts = await runner._enrich_message_with_transcription(
                 "", ["/tmp/a.ogg"],
             )
 

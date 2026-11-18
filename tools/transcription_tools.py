@@ -37,7 +37,7 @@ from tools.transcription_local import (
     _normalize_local_stt_language, _transcribe_local_command, _try_lazy_install_stt,
     build_local_transcribe_kwargs)
 # The ``_transcribe_<provider>`` handlers are looked up in this module's globals by _dispatch_stt_provider.
-from tools.transcription_cloud import (  # noqa: F401 - LuminaVault STT names re-exported below
+from tools.transcription_cloud import (
     STT_CHANNEL_HEADER, STT_ERROR_KIND_AUTH, STT_ERROR_KIND_QUOTA, STT_ERROR_KIND_RATE_LIMIT,
     STT_ERROR_KIND_UPSTREAM, STT_SURFACE_HEADER, STT_SURFACE_VOICE_NOTE, STT_USER_FACING_ERROR_KINDS,
     _STT_CHANNEL, _audio_attribution_headers, _normalize_channel, classify_stt_status,
